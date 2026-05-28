@@ -4,7 +4,7 @@ This project contains the PyTorch layer C++ and Python code for supporting the [
 
 ## Documentation
 
-Full documentation: <https://torch-spyre.readthedocs.io/>
+Full documentation: <https://torch-spyre.readthedocs.io/>.
 
 To build the docs locally:
 
