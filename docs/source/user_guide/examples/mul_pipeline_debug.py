@@ -29,27 +29,26 @@ Compilation pipeline stages captured here
 
 Environment variables used
 --------------------------
-TORCH_COMPILE_DEBUG=1       - dump all intermediate artefacts to
-                              ``torch_compile_debug/`` (SuperDSC JSON,
-                              post-grad graph, schedule, …)
-TORCH_LOGS="+dynamo"        - verbose Dynamo tracing
-TORCH_LOGS="spyre.inductor:DEBUG"
-                            - full Spyre-backend debug logging
-                              (lowering, layout, passes, codegen, …)
-SENCORES=1                  - run on a single AIU core (recommended for
-                              first-pass debugging; isolates multi-core bugs)
+TORCH_COMPILE_DEBUG=1   - dump all intermediate artefacts to
+                          ``torch_compile_debug/`` (SuperDSC JSON,
+                          post-grad graph, schedule, …)
+TORCH_LOGS="+dynamo"    - verbose Dynamo tracing (PyTorch built-in tokens
+                          only; must be set BEFORE python starts)
+SENCORES=1              - run on a single AIU core (recommended for
+                          first-pass debugging; isolates multi-core bugs)
+
+NOTE: ``spyre.*`` namespaces are NOT valid TORCH_LOGS tokens — PyTorch's
+log parser rejects them at import time.  Spyre-backend verbosity is
+controlled inside this script via ``torch_spyre.logging_config``.
 
 Run example (all stages, maximum verbosity)
 -------------------------------------------
-  TORCH_COMPILE_DEBUG=1 \
-  TORCH_LOGS="+dynamo,spyre.inductor:DEBUG" \
-  SENCORES=1 \
+  TORCH_COMPILE_DEBUG=1 TORCH_LOGS="+dynamo" SENCORES=1 \
   python mul_pipeline_debug.py
 
-Run example (passes-only, quieter)
------------------------------------
-  TORCH_LOGS="spyre.inductor.passes:INFO" \
-  python mul_pipeline_debug.py
+Run example (passes-only, no PyTorch noise)
+--------------------------------------------
+  TORCH_COMPILE_DEBUG=1 SENCORES=1 python mul_pipeline_debug.py
 """
 
 import os
@@ -72,11 +71,12 @@ def _banner(title: str) -> None:
 
 # ---------------------------------------------------------------------------
 # 1.  Dynamo FX graph capture
-#     torch.compile(explain=True) returns a structured explanation that
-#     includes the traced FX graph *before* Inductor sees it.
+#     torch._dynamo.explain() does a dry-run trace and returns a structured
+#     breakdown of the captured graphs without submitting any work to the
+#     device.
 # ---------------------------------------------------------------------------
 
-_banner("STAGE 1 — Dynamo FX graph (torch.compile explain=True)")
+_banner("STAGE 1 — Dynamo FX graph (torch._dynamo.explain)")
 
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
@@ -89,7 +89,6 @@ y_device = y.to(DEVICE)
 
 fn = lambda a, b: torch.mul(a, b)
 
-# explain=True does a dry-run trace: it does NOT submit work to the device.
 explanation = torch._dynamo.explain(fn)(x_device, y_device)
 print(explanation)
 
@@ -100,27 +99,29 @@ for i, g in enumerate(explanation.graphs):
 
 # ---------------------------------------------------------------------------
 # 2.  Spyre inductor logging for stages 2-6
-#     Setting TORCH_LOGS at runtime allows us to capture pass-level details
-#     without restarting the process (the logging_config system picks it up on
-#     the next import cycle, but we can also drive it programmatically).
+#
+#     PyTorch's TORCH_LOGS parser only accepts its own registered token names
+#     (e.g. "+dynamo", "+inductor").  It crashes on anything else, including
+#     "spyre.*" namespaces.  TORCH_LOGS is also parsed inside torch.__init__,
+#     so it must be set BEFORE python starts — mutating os.environ here has
+#     no effect on PyTorch's own loggers.
+#
+#     Spyre logging uses a separate logging_config system that we drive
+#     programmatically below.  No env-var needed.
 # ---------------------------------------------------------------------------
 
 _banner("STAGE 2-6 — Inductor passes  (spyre.inductor:DEBUG)")
 
 # Enable all Spyre inductor loggers at DEBUG so we see every pass banner:
-#   •  passes  – BEFORE / AFTER PRE-SCHEDULING listings
+#   •  passes  – BEFORE / AFTER PRE-SCHEDULING op listings
 #   •  lowering  – per-op lowering decisions
 #   •  stickify  – layout assignment per tensor
 #   •  codegen   – SuperDSC JSON fragments
 import torch_spyre.logging_config as _lc
 _lc.set_log_level("spyre.inductor", "DEBUG")
 
-# Also turn on Dynamo + Inductor PyTorch logging so the full schedule and
-# Inductor IR are printed to stderr alongside our Spyre-specific messages:
-os.environ.setdefault("TORCH_LOGS", "+inductor,+dynamo")
-
-# Now do the real compilation + execution.
-# torch.compile is called fresh (reset_code avoids re-using any cached plan).
+# Reset dynamo so we get a fresh compilation rather than a cached plan from
+# the explain() call above.
 torch._dynamo.reset()
 
 compiled = torch.compile(fn)
@@ -155,7 +156,7 @@ else:
     print(
         "  (directory not found — re-run with TORCH_COMPILE_DEBUG=1 to generate artefacts)\n"
         "  Example:\n"
-        "    TORCH_COMPILE_DEBUG=1 python mul_pipeline_debug.py\n"
+        "    TORCH_COMPILE_DEBUG=1 SENCORES=1 python mul_pipeline_debug.py\n"
     )
 
 # ---------------------------------------------------------------------------
@@ -168,4 +169,4 @@ cpu_result = torch.mul(x, y)
 delta = torch.abs(result_spyre - cpu_result).max()
 print(f"CPU result (first 4 elements):    {cpu_result.flatten()[:4]}")
 print(f"Spyre result (first 4 elements):  {result_spyre.flatten()[:4]}")
-print(f"Max |delta|: {delta:.6f}  ({'PASS ✓' if delta < 0.05 else 'FAIL ✗'})")
+print(f"Max |delta|: {delta:.6f}  ({'PASS' if delta < 0.05 else 'FAIL'})")
