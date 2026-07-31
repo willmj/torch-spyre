@@ -899,6 +899,29 @@ def test_sparse_dense_pointwise_d0_stick():
         _compare(lambda a, b: a.amin(-1) + b, a, b)
 
 
+@pytest.mark.parametrize(
+    "shape", [(72, 91), (91, 72), (65, 65)], ids=lambda p: f"{p[0]}x{p[1]}"
+)
+def test_transpose_clone_both_axes_unaligned_multistick(shape):
+    """transpose().clone() where both axes are non-stick-aligned and multi-stick
+    is deterministically wrong; reject it instead of silently corrupting."""
+    x = torch.randn(shape, dtype=torch.float16).to(DEVICE)
+    with pytest.raises(InductorError, match="corrupts data past the first stick"):
+        _compare(lambda t: t.transpose(0, 1).clone(), x)
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(91, 128), (100, 128), (64, 72), (50, 40)],
+    ids=lambda p: f"{p[0]}x{p[1]}",
+)
+def test_transpose_clone_guard_does_not_over_reject(shape):
+    """The guard does not fire for shapes that restickify correctly: an aligned
+    inner axis, or unaligned axes within a single stick."""
+    x = torch.randn(shape, dtype=torch.float16)
+    _compare(lambda t: t.transpose(0, 1).clone(), x, check_strides=False)
+
+
 def test_sparse_broadcast_dense_pointwise_d0_stick():
     """a.sum(-1) + b where b has a d0 stick — verifies sparse detection with alt-dim candidate."""
 

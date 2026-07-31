@@ -35,6 +35,7 @@ from torch_spyre._inductor.constants import (
 )
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.core_mapping import core_to_slice_mapping
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.indirect_access import (
     compute_indirect_max_dim_sizes,
     get_index_tensor_for_value,
@@ -332,6 +333,44 @@ def _get_padded_iteration_space(
                 padding[dim] = layout["stick_size"] - unaligned
                 sdsc_iteration_space[dim] += padding[dim]
     return padding
+
+
+def _check_restickify_stick_alignment(
+    sdsc_args: list[SDSCArgs],
+    sdsc_iteration_space: dict,
+    layouts: dict,
+) -> None:
+    """Guard against a restickify whose source and destination *both* stick on a
+    non-stick-aligned, multi-stick axis.
+
+    Such a case (e.g. ``x.transpose(0, 1).clone()`` where both axes are not
+    multiples of the stick size and both exceed one stick) requires moving data
+    across stick boundaries on the source and destination axes at once, which the
+    SDSC generation does not handle: it silently writes wrong data past the first
+    stick. When at least one axis is stick-aligned, or an unaligned
+    axis fits within a single stick, the restickify is correct. Fail loudly here
+    rather than emit a corrupt descriptor.
+
+    ``sdsc_iteration_space`` must be the pre-padding iteration space (sizes are
+    read before ``_get_padded_iteration_space`` rounds them up to a stick).
+    """
+    unaligned_multi_stick_dims = set()
+    for sdsc_arg in sdsc_args:
+        layout = layouts[sdsc_arg.layout]
+        stick_dim = layout["stick_dim_order"]
+        stick_size = layout["stick_size"]
+        size = sdsc_iteration_space.get(stick_dim)
+        if size is None:
+            continue
+        if size > stick_size and size % stick_size != 0:
+            unaligned_multi_stick_dims.add(stick_dim)
+    if len(unaligned_multi_stick_dims) >= 2:
+        dims = sorted(str(d) for d in unaligned_multi_stick_dims)
+        raise Unsupported(
+            "restickify with the source and destination sticks on different "
+            "non-stick-aligned, multi-stick axes is not supported: it silently "
+            f"corrupts data past the first stick. Axes: {dims}"
+        )
 
 
 def _is_matmul(op: str) -> bool:
@@ -1037,6 +1076,9 @@ def parse_op_spec(op_spec: OpSpec) -> tuple["SDSCSpec", "dict"]:
             [args[0].dim_order],
         )
     elif op_spec.op == RESTICKIFY_OP:
+        # Reject the case that would silently corrupt before any padding rounds
+        # the sizes up. Must run on the pre-padding iteration space.
+        _check_restickify_stick_alignment(args, sdsc_iteration_space, layouts)
         # Pad iteration space using all args so both the old stick (input) and
         # new stick (output) are rounded up to the nearest stick boundary.
         pad_args, pad_sdsc_args, dim_order = (
