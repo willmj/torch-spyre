@@ -80,8 +80,25 @@ ktir_emitter: bool = os.environ.get("TORCH_SPYRE_KTIR", "0") == "1"
 # upfront by ``_check_ktir_device_prerequisites`` in ``execution/async_compile``,
 # which names anything missing.
 
-# A .mlir declaring the target device, passed to the backend compiler.
-ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR", "")
+
+# A function, not module-level temporaries: install_config_module turns every
+# non-dunder module attribute into a config entry but skips functions, so this
+# keeps the intermediates out of the config namespace.
+def _default_device_mlir() -> str:
+    root = os.environ.get("DEEPTOOLS_INSTALL_DIR")
+    if not root:
+        return ""
+    spec = os.path.join(
+        root, "share/sys-arch-spec/KTDFArchGraphDevice/spyre_dd2_basic.mlir"
+    )
+    return spec if os.path.isfile(spec) else ""
+
+
+# A .mlir declaring the target device, passed to the backend compiler. Defaults
+# to the arch spec the deeptools install ships, so it comes from the same install
+# as the dbo-opt that consumes it. Stays empty when that file is absent rather
+# than becoming a guessed path, so the prerequisite check still names it.
+ktir_device_mlir: str = os.environ.get("KTIR_DEVICE_MLIR") or _default_device_mlir()
 
 # Enable certified LX ownership changes: movement, exact fused-axis views,
 # consumer-compatible producer order, and same-core restickify residency.
