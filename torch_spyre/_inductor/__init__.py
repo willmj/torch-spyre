@@ -205,8 +205,12 @@ def enable_spyre_compile_fx_wrapper():
 def _light_autoload():
     from . import decompositions  # noqa: F401
     from . import distributed as _distributed_init  # noqa: F401  registers spyre::broadcast_async/wait_work
+    from . import torch_phases
 
     enable_spyre_compile_fx_wrapper()
+    # Before any compile rather than inside enable_spyre_context, which opens too
+    # late to see Dynamo tracing.
+    torch_phases.install()
 
 
 def _autoload():
