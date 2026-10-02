@@ -58,6 +58,7 @@ from torch_spyre._inductor.work_division import (
     has_resolved_work_div_hint,
     work_division_splits_are_legal,
 )
+from torch_spyre._inductor import timing_recorder
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.scratchpad.plan_solver import (
     cost_expr_record,
@@ -377,16 +378,33 @@ class ScratchpadAllocator:
             if lx_relayout_plans is not None:
                 logger.debug("Recollect LX relayout plans after allocator pre-passes")
             lx_relayout_plans = None
-        self._run_passes(self.pre_optimization_passes, graph)
-        buffers = self._prepare_buffers(graph, lx_relayout_plans=lx_relayout_plans)
-        solver = self._build_solver(buffers)
-        allocation = self._solve(solver, graph)
-        accepted_lx_relayouts = self._finalize_lx_relayout_allocation(allocation, graph)
-        self._post_solve(graph, allocation, accepted_lx_relayouts)
-        reasons = self._get_spill_reasons(solver, allocation)
-        self._push_allocation(graph, allocation, accepted_lx_relayouts)
-        self._log_lx_pinning(graph, reasons)
-        self._run_passes(self.post_optimization_passes, graph)
+        # Substage timing: this pass is ~87% of frontend compile and the per-pass
+        # timer treats it as one region, so the template's own hooks are the
+        # finest attribution available without guessing.
+        stage = timing_recorder.stage
+        with stage("stage:Scratchpad:pre_passes"):
+            self._run_passes(self.pre_optimization_passes, graph)
+        with stage("stage:Scratchpad:prepare_buffers") as event:
+            buffers = self._prepare_buffers(graph, lx_relayout_plans=lx_relayout_plans)
+        event.meta["buffers"] = len(buffers)
+        with stage("stage:Scratchpad:build_solver"):
+            solver = self._build_solver(buffers)
+        with stage("stage:Scratchpad:solve", buffers=len(buffers)):
+            allocation = self._solve(solver, graph)
+        with stage("stage:Scratchpad:finalize_relayout"):
+            accepted_lx_relayouts = self._finalize_lx_relayout_allocation(
+                allocation, graph
+            )
+        with stage("stage:Scratchpad:post_solve"):
+            self._post_solve(graph, allocation, accepted_lx_relayouts)
+        with stage("stage:Scratchpad:spill_reasons"):
+            reasons = self._get_spill_reasons(solver, allocation)
+        with stage("stage:Scratchpad:push_allocation"):
+            self._push_allocation(graph, allocation, accepted_lx_relayouts)
+        with stage("stage:Scratchpad:log_pinning"):
+            self._log_lx_pinning(graph, reasons)
+        with stage("stage:Scratchpad:post_passes"):
+            self._run_passes(self.post_optimization_passes, graph)
 
     @staticmethod
     def _run_passes(
