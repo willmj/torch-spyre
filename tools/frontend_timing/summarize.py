@@ -183,6 +183,23 @@ class Record:
                 )
         return totals
 
+    def self_by_prefix(self, prefix: str) -> dict[str, int]:
+        """Self time per region: inclusive minus direct children.
+
+        Recorded alongside the inclusive series because they answer different
+        questions and neither substitutes for the other. Inclusive is what the
+        frontend subtraction needs and what shows the nesting; it also sums to more
+        than the compile, so ranking regions by it puts every ancestor of the hot
+        pass at ~100% and says nothing. Self time is what ranks cost.
+        """
+        totals: dict[str, int] = {}
+        for event in self.events:
+            if event["name"].startswith(prefix):
+                totals[event["name"]] = totals.get(event["name"], 0) + int(
+                    event["self_ns"]
+                )
+        return totals
+
 
 #: Version of the rows file. A consumer that does not know this string should refuse the
 #: file rather than guess, the way the recorder's own RECORDER_VERSION works.
@@ -195,6 +212,10 @@ def metric_key(event_name: str) -> str:
     One grammar for every metric name, because these become warehouse Map keys: dots
     rather than colons so the names survive tools that treat a colon as a separator, and
     a unit suffix so a reader never has to guess milliseconds from nanoseconds.
+
+    Each region also gets a ``..._self_ms`` sibling. Adding metric names is additive,
+    so a reader written against the older rows file keeps working -- it simply does
+    not see them.
     """
     return event_name.replace(":", ".") + "_ms"
 
@@ -319,6 +340,9 @@ def measurements(group: list[Record]) -> dict[str, list[float]]:
         ):
             if size is not None:
                 add(key, size)
+        for prefix in ("stage:", "pass:", "pipeline:"):
+            for name, ns in record.self_by_prefix(prefix).items():
+                add(metric_key(name)[:-3] + "_self_ms", ns / 1e6)
         for name, ns in record.by_prefix("stage:").items():
             # The compile root is already total_ms; recording it twice would let a
             # careless sum double the whole compile.
