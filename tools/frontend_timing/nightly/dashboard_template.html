@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Frontend sweep</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column. Latest night first, then every metric against date. */
+:root {
+  --surface: #fcfcfb; --surface-2: #f4f3f0;
+  --ink: #16160f; --ink-2: #55544c; --ink-3: #85837a; --rule: #e2e0d9;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --quiet: #b9b7ae;
+  --seq-2: #9ec5f4; --seq-3: #6da7ec; --seq-4: #3987e5; --seq-5: #256abf; --seq-6: #184f95;
+  --bad: #e34948;
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  color-scheme: dark;
+  --surface: #1a1a19; --surface-2: #242423;
+  --ink: #f6f5ef; --ink-2: #c3c2b7; --ink-3: #8e8d84; --rule: #34342f;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --quiet: #5a594f;
+  --seq-2: #184f95; --seq-3: #1c5cab; --seq-4: #256abf; --seq-5: #5598e7; --seq-6: #86b6ef;
+  --bad: #e66767;
+} }
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface: #1a1a19; --surface-2: #242423;
+  --ink: #f6f5ef; --ink-2: #c3c2b7; --ink-3: #8e8d84; --rule: #34342f;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --quiet: #5a594f;
+  --seq-2: #184f95; --seq-3: #1c5cab; --seq-4: #256abf; --seq-5: #5598e7; --seq-6: #86b6ef;
+  --bad: #e66767;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--surface); color: var(--ink); font-family: var(--sans); line-height: 1.55; }
+.wrap { max-width: 1060px; margin: 0 auto; padding-inline: 20px; padding-block: 36px 72px; }
+h1 { font-size: clamp(1.6rem,4vw,2.2rem); font-weight: 600; letter-spacing: -0.02em; margin: 0 0 6px; text-wrap: balance; }
+h2 { font-size: 1.18rem; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.01em; }
+.eyebrow { font-family: var(--mono); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.09em; color: var(--ink-3); margin: 0 0 4px; }
+.sub { color: var(--ink-2); max-width: 70ch; margin: 0; }
+section { margin-top: 46px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit,minmax(150px,1fr)); gap: 1px; background: var(--rule); border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; margin-top: 24px; }
+.tile { background: var(--surface); padding: 15px 17px; }
+.tile .k { font-family: var(--mono); font-size: 0.67rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-3); }
+.tile .v { font-size: 1.7rem; font-weight: 600; font-variant-numeric: tabular-nums; letter-spacing: -0.02em; line-height: 1.15; margin-top: 2px; }
+.tile .v small { font-size: 0.75rem; font-weight: 500; color: var(--ink-3); letter-spacing: 0; }
+.chartbox { border: 1px solid var(--rule); border-radius: 10px; background: var(--surface); padding: 14px 10px 8px; margin-top: 16px; }
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 2px 0; font-size: 0.83rem; color: var(--ink-2); }
+.legend i { display: inline-block; width: 11px; height: 11px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.note { color: var(--ink-2); font-size: 0.9rem; max-width: 72ch; margin: 10px 0 0; }
+details { margin-top: 10px; }
+summary { cursor: pointer; font-family: var(--mono); font-size: 0.74rem; color: var(--ink-3); letter-spacing: 0.04em; }
+summary:focus-visible { outline: 2px solid var(--s1); outline-offset: 3px; border-radius: 3px; }
+.tblwrap { overflow-x: auto; margin-top: 8px; }
+table { border-collapse: collapse; font-size: 0.82rem; font-variant-numeric: tabular-nums; min-width: 100%; }
+th, td { text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--rule); white-space: nowrap; }
+th:first-child, td:first-child { text-align: left; font-family: var(--mono); font-size: 0.77rem; }
+th { color: var(--ink-3); font-weight: 500; font-size: 0.71rem; text-transform: uppercase; letter-spacing: 0.06em; }
+.axis text { fill: var(--ink-3); font-size: 10px; font-family: var(--mono); }
+.axis line { stroke: var(--rule); }
+.glab { fill: var(--ink-2); font-size: 10.5px; font-family: var(--mono); }
+.vlab { fill: var(--ink); font-size: 11px; font-family: var(--mono); font-weight: 500; }
+.strip { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
+.night { font-family: var(--mono); font-size: 0.7rem; padding: 4px 8px; border-radius: 5px; border: 1px solid var(--rule); background: var(--surface-2); color: var(--ink-2); }
+.night.skipped { border-color: var(--bad); color: var(--bad); }
+.tip { position: fixed; pointer-events: none; z-index: 20; background: var(--ink); color: var(--surface); font-family: var(--mono); font-size: 11px; line-height: 1.45; padding: 7px 9px; border-radius: 6px; opacity: 0; transition: opacity .1s; max-width: 280px; }
+.tip.on { opacity: 1; }
+.hit { fill: transparent; cursor: crosshair; }
+footer { margin-top: 52px; padding-top: 16px; border-top: 1px solid var(--rule); color: var(--ink-3); font-size: 0.82rem; }
+code { font-family: var(--mono); font-size: 0.86em; background: var(--surface-2); padding: 1px 4px; border-radius: 3px; }
+@media (prefers-reduced-motion: reduce) { .tip { transition: none; } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="eyebrow">Torch-Spyre · frontend compiler</p>
+  <h1>Nightly compile sweep</h1>
+  <p class="sub" id="lede"></p>
+  <div class="tiles" id="tiles"></div>
+
+  <section>
+    <p class="eyebrow">Latest night</p>
+    <h2>Where the time went</h2>
+    <p class="sub">Self time per region, summing each point's median. Ranked by self rather than inclusive time: every ancestor of the hot pass encloses it, so an inclusive ranking puts a dozen regions near 100%.</p>
+    <div class="chartbox"><svg id="c-regions" role="img" aria-label="Self time per compiler region"></svg></div>
+    <p class="note" id="regions-note"></p>
+    <details><summary>Show data</summary><div class="tblwrap" id="t-regions"></div></details>
+  </section>
+
+  <section>
+    <p class="eyebrow">Latest night</p>
+    <h2>Every point</h2>
+    <p class="sub">Sorted by cost. Parameters shown are the ones that vary inside each workload family; the rest are the family's fixed shape.</p>
+    <details><summary>Show all points</summary><div class="tblwrap" id="t-points"></div></details>
+  </section>
+
+  <section>
+    <p class="eyebrow">Over time</p>
+    <h2>Compile cost per night</h2>
+    <p class="sub">The costliest points on the latest night, in seconds. A gap is a night that produced no records; its reason is in the strip below.</p>
+    <div class="chartbox"><svg id="c-trend" role="img" aria-label="Frontend compile seconds per night"></svg></div>
+    <div class="legend" id="l-trend"></div>
+  </section>
+
+  <section>
+    <p class="eyebrow">Over time</p>
+    <h2>Share taken by the hot pass</h2>
+    <p class="sub">Scratchpad planning as a percentage of frontend time. One series, so no legend: the title names it.</p>
+    <div class="chartbox"><svg id="c-share" role="img" aria-label="Hot pass share per night"></svg></div>
+  </section>
+
+  <section>
+    <p class="eyebrow">Over time</p>
+    <h2>Work counters per operation</h2>
+    <p class="sub">On their own chart because they are counts, not milliseconds, and a second y-scale is the one chart mistake worth refusing. These are the signal to watch: across a 50-point sweep the counters varied 0.00% between samples against 3.68% for times, so a step here is a real change and a timing wobble usually is not.</p>
+    <div class="chartbox"><svg id="c-counters" role="img" aria-label="Analysis calls per graph operation per night"></svg></div>
+    <div class="legend" id="l-counters"></div>
+    <details><summary>Show data</summary><div class="tblwrap" id="t-trend"></div></details>
+  </section>
+
+  <section>
+    <p class="eyebrow">Over time</p>
+    <h2>Every night, and what it measured</h2>
+    <p class="sub">The tree each night swept. A flat line across a skipped night means nothing was measured, not that nothing changed.</p>
+    <div class="strip" id="strip"></div>
+  </section>
+
+  <footer id="prov"></footer>
+</div>
+<div class="tip" id="tip" role="status" aria-live="polite"></div>
+<script>
+const D = __DATA__;
+const $ = s => document.querySelector(s);
+const NS = "http://www.w3.org/2000/svg";
+const fmt = (n, d = 0) => (n == null ? "–" : n.toLocaleString(undefined, {minimumFractionDigits: d, maximumFractionDigits: d}));
+const SERIES = ["var(--s1)", "var(--s2)", "var(--s3)"];
+
+function el(tag, attrs = {}, text) {
+  const n = document.createElementNS(NS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (text != null) n.textContent = text;
+  return n;
+}
+const tip = $("#tip");
+function wire(node, html) {
+  node.addEventListener("pointerenter", e => { tip.innerHTML = html; tip.classList.add("on"); move(e); });
+  node.addEventListener("pointermove", move);
+  node.addEventListener("pointerleave", () => tip.classList.remove("on"));
+}
+function move(e) {
+  const pad = 14, w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = e.clientX + pad, y = e.clientY - h - pad;
+  if (x + w > innerWidth - 8) x = e.clientX - w - pad;
+  if (y < 8) y = e.clientY + pad;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+function table(host, cols, rows) {
+  const t = document.createElement("table");
+  const h = t.insertRow();
+  cols.forEach(c => { const th = document.createElement("th"); th.textContent = c; h.appendChild(th); });
+  rows.forEach(r => { const tr = t.insertRow(); r.forEach(v => { tr.insertCell().textContent = v; }); });
+  host.replaceChildren(t);
+}
+
+/* ---- header ---- */
+(function header() {
+  const L = D.latest;
+  if (!L) {
+    $("#lede").textContent = "No night has produced records yet.";
+    return;
+  }
+  const a = L.agg;
+  $("#lede").textContent =
+    `${L.day}: ${a.points} points swept at ${a.git_sha || "an unrecorded sha"} on torch ${a.torch}. `
+    + `${D.trend.days.length} nights on record.`;
+  const rows = [
+    ["in one pass", `${fmt(a.hot_share, 1)}<small>%</small>`],
+    ["frontend total", `${fmt(a.frontend_s, 0)}<small>s</small>`],
+    ["points", `${a.points}`],
+    ["extractions / op", fmt(a["counter.read_writes.extractions"], 1)],
+  ];
+  $("#tiles").replaceChildren(...rows.map(([k, v]) => {
+    const d = document.createElement("div");
+    d.className = "tile";
+    d.innerHTML = `<div class="k">${k}</div><div class="v">${v}</div>`;
+    return d;
+  }));
+})();
+
+/* ---- latest night: regions, sequential ramp ---- */
+function regions() {
+  const svg = $("#c-regions"); svg.replaceChildren();
+  if (!D.latest) return;
+  const rows = D.latest.regions.rows, dropped = D.latest.regions.excluded;
+  const W = svg.clientWidth || 900, bar = 22, gap = 8, left = Math.min(300, W * 0.42), right = 64;
+  svg.setAttribute("viewBox", `0 0 ${W} ${rows.length * (bar + gap) + 20}`);
+  const max = Math.max(...rows.map(r => r.s));
+  const ramp = ["var(--seq-6)", "var(--seq-5)", "var(--seq-4)", "var(--seq-3)", "var(--seq-2)"];
+  rows.forEach((r, i) => {
+    const y = i * (bar + gap) + 4;
+    const w = Math.max(2, (r.s / max) * (W - left - right));
+    const g = el("g");
+    g.appendChild(el("rect", {x: left, y, width: w, height: bar, rx: 4, fill: ramp[Math.min(Math.floor(i / 3), 4)]}));
+    g.appendChild(el("text", {x: left - 10, y: y + bar / 2 + 3.5, "text-anchor": "end", class: "glab"}, r.name));
+    g.appendChild(el("text", {x: left + w + 8, y: y + bar / 2 + 3.5, class: "vlab"}, fmt(r.s, 1) + "s"));
+    g.appendChild(el("rect", {x: 0, y, width: W, height: bar, class: "hit"}));
+    wire(g, `<b>${r.name}</b><br>${fmt(r.s, 1)} s self · ${r.pct.toFixed(2)}% of frontend`);
+    svg.appendChild(g);
+  });
+  if (dropped) {
+    $("#regions-note").textContent =
+      `${dropped.name} is excluded from the chart: at ${dropped.s.toLocaleString()} s `
+      + `(${dropped.pct}% of frontend) it would flatten every other bar. It is the `
+      + `figure in the tile above.`;
+  }
+  table($("#t-regions"), ["region (self time)", "total s", "share %"],
+    (dropped ? [dropped, ...rows] : rows).map(r => [r.name, fmt(r.s, 1), r.pct.toFixed(2)]));
+}
+
+/* ---- a date-axis line chart, with gaps for skipped nights ---- */
+function trend(svgSel, legendSel, series, unit, decimals, domain) {
+  const svg = $(svgSel); svg.replaceChildren();
+  const days = D.trend.days, notes = D.trend.notes;
+  const names = Object.keys(series);
+  const all = names.flatMap(n => series[n]).filter(v => v != null);
+  if (!all.length) return;
+  // A legend carries identity for multiple series, so the end-of-line label is
+  // redundant there and long point names overflow the right margin.
+  const endLabels = !legendSel || Object.keys(series).length === 1;
+  const W = svg.clientWidth || 900, H = 260, L = 58, T = 16, B = 46;
+  const R = endLabels ? 150 : 24;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const max = domain ? domain[1] : Math.max(...all);
+  const min = domain ? domain[0] : Math.min(0, ...all);
+  const px = i => L + (days.length === 1 ? 0.5 : i / (days.length - 1)) * (W - L - R);
+  const py = v => H - B - ((v - min) / ((max - min) || 1)) * (H - T - B);
+
+  const ax = el("g", {class: "axis"});
+  [0, .25, .5, .75, 1].forEach(f => {
+    const v = min + f * (max - min);
+    ax.appendChild(el("line", {x1: L, y1: py(v), x2: W - R, y2: py(v)}));
+    ax.appendChild(el("text", {x: L - 8, y: py(v) + 3.5, "text-anchor": "end"}, fmt(v, decimals) + unit));
+  });
+  // Every other label when crowded, so dates never collide.
+  const step = Math.ceil(days.length / 8);
+  days.forEach((d, i) => {
+    if (i % step) return;
+    ax.appendChild(el("text", {x: px(i), y: H - B + 15, "text-anchor": "middle"}, d.slice(5)));
+  });
+  svg.appendChild(ax);
+
+  names.forEach((name, si) => {
+    const color = SERIES[si % SERIES.length];
+    const vals = series[name];
+    // Break the path at every gap: a line drawn through a skipped night would
+    // interpolate a measurement nobody took.
+    let d = "", open = false;
+    vals.forEach((v, i) => {
+      if (v == null) { open = false; return; }
+      d += `${open ? "L" : "M"}${px(i)},${py(v)}`;
+      open = true;
+    });
+    if (d) svg.appendChild(el("path", {d, fill: "none", stroke: color, "stroke-width": 2, "stroke-linejoin": "round"}));
+    let lastIdx = -1;
+    vals.forEach((v, i) => {
+      if (v == null) return;
+      lastIdx = i;
+      const c = el("circle", {cx: px(i), cy: py(v), r: 4.5, fill: color, stroke: "var(--surface)", "stroke-width": 2});
+      const n = notes[i] || {};
+      wire(c, `<b>${name}</b><br>${days[i]} · ${fmt(v, decimals)}${unit}`
+        + (n.sha ? `<br>sha ${n.sha}` : "") + (n.state && n.state !== "ok" ? `<br>${n.state}` : ""));
+      svg.appendChild(c);
+    });
+    if (lastIdx >= 0 && endLabels) {
+      svg.appendChild(el("text", {
+        x: px(lastIdx) + 10, y: py(vals[lastIdx]) + 4, class: "vlab", fill: color,
+      }, name));
+    }
+  });
+  if (legendSel && names.length > 1) {
+    $(legendSel).replaceChildren(...names.map((n, i) => {
+      const s = document.createElement("span");
+      s.innerHTML = `<i style="background:${SERIES[i % SERIES.length]}"></i>${n}`;
+      return s;
+    }));
+  }
+}
+
+/* ---- the night strip: what each night actually measured ---- */
+function strip() {
+  $("#strip").replaceChildren(...D.trend.notes.map(n => {
+    const d = document.createElement("div");
+    d.className = "night" + (n.state === "ok" ? "" : " skipped");
+    d.textContent = `${n.day.slice(5)} ${n.sha || "—"}`;
+    d.title = n.state + (n.detail ? `: ${n.detail}` : "");
+    return d;
+  }));
+}
+
+function points() {
+  if (!D.latest) return;
+  table($("#t-points"), ["point", "ops", "frontend s", "scratchpad %", "extract/op"],
+    D.latest.points.map(p => [
+      p.short || p.name,
+      fmt(p.ops), fmt(p.frontend_s, 1), fmt(p.hot_pct, 1), fmt(p.ext_per_op, 1),
+    ]));
+}
+
+function trendTable() {
+  const t = D.trend, cs = Object.keys(t.counters);
+  table($("#t-trend"),
+    ["night", "sha", "state", "hot share %", ...cs.map(c => c.replace("counter.", "") + "/op")],
+    t.days.map((d, i) => [
+      d, t.notes[i].sha || "—", t.notes[i].state,
+      fmt(t.hot_share[i], 1), ...cs.map(c => fmt(t.counters[c][i], 1)),
+    ]));
+}
+
+function prov() {
+  $("#prov").innerHTML =
+    `Frontend-only compiles: caches disabled, one compile thread, one process per sample, serial. `
+    + `Counters are deterministic counts of analysis calls; times are medians of the night's samples. `
+    + `Regenerated by <code>dashboard.py</code> at ${D.generated.slice(0, 16).replace("T", " ")}.`;
+}
+
+function draw() {
+  regions();
+  const cs = {};
+  for (const k in D.trend.counters) cs[k.replace("counter.", "")] = D.trend.counters[k];
+  trend("#c-trend", "#l-trend", D.trend.frontend_s, "s", 0);
+  trend("#c-share", null, {"scratchpad planning": D.trend.hot_share}, "%", 0, [0, 100]);
+  trend("#c-counters", "#l-counters", cs, "", 0);
+  strip(); points(); trendTable(); prov();
+}
+draw();
+let t; addEventListener("resize", () => { clearTimeout(t); t = setTimeout(draw, 150); });
+</script>
+</body>
+</html>
