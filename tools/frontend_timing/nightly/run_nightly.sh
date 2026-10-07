@@ -175,12 +175,16 @@ cd "$REPO"
 [ "$ok" = 1 ] || { status failed "device never came free"; exit 1; }
 
 # ---- 4. sweep ------------------------------------------------------------
-if ! python3 -u tools/frontend_timing/run_sweep.py \
-        --plan tools/frontend_timing/sweep_plan.json \
-        --tier "$TIER" --samples "$SAMPLES" --out "$OUT/records"; then
-    status failed "sweep exited non-zero"
-    exit 1
-fi
+# A non-zero exit here means *some* sample failed, not that the night did: the
+# device drops roughly one sample in eighty with a libflex or senlib crash, and
+# the summarizer already excludes a bad record rather than averaging it. Discard
+# the whole night for one flake and the trend gets holes for no reason. Only an
+# empty rows.json below is fatal.
+python3 -u tools/frontend_timing/run_sweep.py \
+    --plan tools/frontend_timing/sweep_plan.json \
+    --tier "$TIER" --samples "$SAMPLES" --out "$OUT/records"
+sweep_rc=$?
+failed_samples="$(grep -c 'FAILED after' "$LOG" 2>/dev/null || echo 0)"
 
 # ---- 5. summarize --------------------------------------------------------
 python3 tools/frontend_timing/summarize.py "$OUT/records" \
@@ -190,8 +194,14 @@ python3 tools/frontend_timing/scaling.py "$OUT/rows.json" > "$OUT/scaling.md" 2>
 [ -s "$OUT/rows.json" ] || { status failed "no rows.json; summarizer rejected every record"; exit 1; }
 
 # ---- 6. dashboard --------------------------------------------------------
-status ok "$(python3 -c "
+# Flaked samples are carried in the detail rather than hidden: a night with many
+# of them is still usable but worth distrusting.
+detail="$(python3 -c "
 import json; print(len(json.load(open('$OUT/rows.json'))['points']), 'points')" 2>/dev/null || echo swept)"
+if [ "${failed_samples:-0}" -gt 0 ] 2>/dev/null; then
+    detail="$detail, $failed_samples sample(s) flaked (sweep rc=$sweep_rc)"
+fi
+status ok "$detail"
 python3 tools/frontend_timing/nightly/dashboard.py "$NIGHTLY/history" \
     --out "$NIGHTLY/dashboard.html" || echo "dashboard render failed (records are still on disk)"
 
