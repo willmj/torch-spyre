@@ -57,7 +57,7 @@ PY
 
 cd "$REPO" 2>/dev/null || { mkdir -p "$OUT"; status failed "no checkout at $REPO; run setup_nightly.sh"; exit 1; }
 
-# ---- 1. graft ------------------------------------------------------------
+# ---- 1. graft (merge main in) --------------------------------------------
 # One conflict surface by design: the integration branch carries every piece of
 # instrumentation, and this rebases it onto today's main. async_compile.py has
 # conflicted three times in nine days, so the abort path is the common one.
@@ -76,15 +76,20 @@ git checkout --quiet -B nightly FETCH_HEAD
 git config user.name  "$(git config --get user.name  || echo 'nightly sweep')"
 git config user.email "$(git config --get user.email || echo 'nightly@localhost')"
 
-if ! rebase_err="$(git rebase upstream/main 2>&1)"; then
+# Merge main in, rather than rebase onto it. The integration branch is itself
+# assembled from merges of the four PR branches, so a rebase replays all of that
+# history commit by commit and re-fights conflicts already resolved on the
+# branch -- eighteen conflict surfaces instead of one. A merge resolves against
+# the merge base and keeps those resolutions.
+if ! merge_err="$(git merge --no-edit upstream/main 2>&1)"; then
     conflicted="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
-    git rebase --abort 2>/dev/null
+    git merge --abort 2>/dev/null
     if [ -n "$conflicted" ]; then
         status skipped "graft conflict in: $conflicted"
     else
         # Not a conflict. Reporting one would send someone to resolve a merge
         # that never happened, so say what git actually said.
-        status failed "graft failed, no conflict: $(tail -3 <<<"$rebase_err" | tr '\n' ' ')"
+        status failed "graft failed, no conflict: $(tail -3 <<<"$merge_err" | tr '\n' ' ')"
     fi
     exit 1
 fi
