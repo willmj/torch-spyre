@@ -13,7 +13,8 @@ set -uo pipefail
 
 NIGHTLY="${NIGHTLY_ROOT:-$HOME/nightly}"
 REPO="$NIGHTLY/torch-spyre"
-VENV="$NIGHTLY/.venv"
+DEV="${DEV_REPO:-$HOME/dt-inductor/torch-spyre}"
+VENV="${DEV_VENV:-$HOME/.venv}"
 GRAFT_BRANCH="${GRAFT_BRANCH:-perf/nightly-integration}"
 TIER="${SWEEP_TIER:-nightly}"
 SAMPLES="${SWEEP_SAMPLES:-3}"
@@ -65,41 +66,69 @@ git fetch upstream main --quiet || { status failed "cannot reach upstream"; exit
 git fetch origin "$GRAFT_BRANCH" --quiet || { status failed "no graft branch $GRAFT_BRANCH"; exit 1; }
 
 git rebase --abort 2>/dev/null
+# This checkout is machine-managed and holds nothing worth keeping: the borrowed
+# _C.so symlink and the generated _version.py are both re-made below. Resetting
+# makes the job idempotent, and a rebase refuses outright on a dirty tree.
+git reset --hard --quiet
 git checkout --quiet -B nightly FETCH_HEAD
-if ! git rebase upstream/main >/dev/null 2>&1; then
+# A rebase needs a committer identity, and a fresh clone has none. Local to this
+# checkout so it cannot leak into the dev tree.
+git config user.name  "$(git config --get user.name  || echo 'nightly sweep')"
+git config user.email "$(git config --get user.email || echo 'nightly@localhost')"
+
+if ! rebase_err="$(git rebase upstream/main 2>&1)"; then
     conflicted="$(git diff --name-only --diff-filter=U | tr '\n' ' ')"
     git rebase --abort 2>/dev/null
-    status skipped "graft conflict in: ${conflicted:-unknown}"
+    if [ -n "$conflicted" ]; then
+        status skipped "graft conflict in: $conflicted"
+    else
+        # Not a conflict. Reporting one would send someone to resolve a merge
+        # that never happened, so say what git actually said.
+        status failed "graft failed, no conflict: $(tail -3 <<<"$rebase_err" | tr '\n' ' ')"
+    fi
     exit 1
 fi
 echo "grafted $GRAFT_BRANCH onto main $(git rev-parse --short upstream/main)"
 
-# ---- 2. build ------------------------------------------------------------
+# ---- 2. point at the grafted tree ----------------------------------------
+# No build. The dev venv is read for torch (2.13.0+cpu is a local-version wheel
+# with no copy on the PVC, so a private venv cannot reproduce it) and PYTHONPATH
+# makes torch_spyre resolve here instead: the editable install's finder is
+# appended to sys.meta_path, so the standard PathFinder runs first. The built
+# extension is borrowed from the dev tree, the way ~/ab4859/tsw-base does.
 source "$VENV/bin/activate" || { status failed "no venv at $VENV"; exit 1; }
-# setuptools_scm writes this at build time; anything reading the version dies
-# without it, which looks like a code bug and is not.
-PYTHONPATH=. python3 -c "
+export PYTHONPATH="$REPO"
+
+ln -sfn "$DEV/torch_spyre/_C.so" "$REPO/torch_spyre/_C.so" 2>/dev/null
+[ -e "$REPO/torch_spyre/_C.so" ] || { status failed "no built extension to borrow from $DEV"; exit 1; }
+
+# A fresh clone has no _version.py; it is written at build time and nothing here
+# builds. Anything reading the version dies without it, which looks like a code
+# bug and is not.
+if [ ! -f torch_spyre/_version.py ]; then
+    PYTHONPATH=. python3 -c "
 from setuptools_scm import get_version
 get_version(root='.', relative_to='pyproject.toml',
             version_file='torch_spyre/_version.py',
             version_scheme='semver-pep440-release-branch',
             local_scheme='_versioning:ci_local_scheme')" >/dev/null 2>&1
-if ! uv pip install -e . --no-build-isolation --quiet; then
-    status failed "build failed after graft"
-    exit 1
 fi
+[ -f torch_spyre/_version.py ] || { status failed "could not write _version.py"; exit 1; }
 
 # ---- 3. smoke ------------------------------------------------------------
-# A trivial compile first: if this fails the night is an ABI or device problem,
-# not a measurement, and numbers from it would be worse than no numbers.
-# Retries only the transient fault. MMAPNotSupported is a platform-wide
-# condition and no retry helps, so it stops the run.
+# A trivial compile first. If this fails the night is an ABI or device problem,
+# not a measurement, and numbers from it would be worse than none. Each failure
+# gets its own status, because they need different responses: a borrowed
+# extension older than the Python calling it needs the dev tree rebuilt, a
+# platform VFIO fault needs nobody to do anything, and a busy device needs a
+# retry.
 smoke() { cd "$HOME" && python3 -c "
 import torch, torch_spyre
 x = torch.randn(8, 8, dtype=torch.float16, device='spyre')
 w = torch.randn(8, 8, dtype=torch.float16, device='spyre')
 torch.compile(lambda a, b: torch.relu(a @ b))(x, w)
-print('smoke ok')"; }
+import os
+print('smoke ok via', os.path.dirname(torch_spyre.__file__))"; }
 
 ok=0
 for attempt in 1 2 3; do
@@ -111,6 +140,13 @@ for attempt in 1 2 3; do
     fi
     if grep -q "DeviceOpenFail\|Device or resource busy" <<<"$out"; then
         echo "  [device busy, attempt $attempt/3]"; sleep 70; continue
+    fi
+    # The borrowed extension predates the Python calling it, which happens
+    # whenever main changes C++ and the dev tree has not been rebuilt. Named
+    # explicitly because it reads like a code bug and is not.
+    if grep -qE "incompatible function arguments|undefined symbol" <<<"$out"; then
+        status skipped "borrowed _C.so is older than this tree; rebuild the dev checkout"
+        exit 1
     fi
     status failed "smoke compile failed"
     exit 1
