@@ -104,6 +104,21 @@ echo "grafted $GRAFT_BRANCH onto main $(git rev-parse --short upstream/main)"
 source "$VENV/bin/activate" || { status failed "no venv at $VENV"; exit 1; }
 export PYTHONPATH="$REPO"
 
+# _C.so links libflex, libspyre_comms and friends from the custom runtime under
+# $HOME, and the image puts those on LD_LIBRARY_PATH through a login profile. A
+# non-login invocation loses them and the import dies with
+# "libspyre_comms.so.1: cannot open shared object file", which reads like a
+# broken build. Re-add them ahead of the image's own /opt/ibm/spyre copies.
+S="${SENTIENT_ROOT:-$HOME/dt-inductor/sentient}"
+if [ -d "$S" ]; then
+    for lib in spyre_comms libaiupti runtime deeptools; do
+        case ":$LD_LIBRARY_PATH:" in
+            *":$S/$lib/lib:"*) ;;
+            *) export LD_LIBRARY_PATH="$S/$lib/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+        esac
+    done
+fi
+
 ln -sfn "$DEV/torch_spyre/_C.so" "$REPO/torch_spyre/_C.so" 2>/dev/null
 [ -e "$REPO/torch_spyre/_C.so" ] || { status failed "no built extension to borrow from $DEV"; exit 1; }
 
