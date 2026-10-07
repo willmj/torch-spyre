@@ -7,7 +7,6 @@ python3 tools/frontend_timing/baseline_tables.py \
     tools/frontend_timing/baseline/baseline-2026-10-02.json
 ```
 
-
 ## Provenance
 
 | field | value |
@@ -182,4 +181,3 @@ samples. A bracketed label marks an A/B arm.
 | B=1, S=512, E=5120, heads=40, intermediate=16384 | 20.2 | ±5.7% | 34 | 89% | 5,797 | 170.5 | 99.69% | 1,845 |
 | B=1, S=512, E=4096, heads=32, intermediate=14336 | 20.2 | ±2.7% | 34 | 89% | 5,487 | 161.4 | 99.65% | 1,719 |
 | B=1, S=128, E=4096, heads=32, intermediate=14336 | 20.9 | ±0.9% | 34 | 90% | 6,085 | 179.0 | 99.61% | 2,226 |
-

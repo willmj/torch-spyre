@@ -113,9 +113,7 @@ class Record:
         return sum(e["inclusive_ns"] for e in self.events if e["name"] == name)
 
     def backend_ns(self) -> int:
-        return sum(
-            e["inclusive_ns"] for e in self.events if e["name"] == BACKEND_EVENT
-        )
+        return sum(e["inclusive_ns"] for e in self.events if e["name"] == BACKEND_EVENT)
 
     def graph_operations(self) -> int | None:
         """Largest pre-scheduling graph this process compiled, or None if it had none.

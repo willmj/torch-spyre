@@ -281,10 +281,13 @@ def main() -> int:
             ],
         }
 
-    template = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "dashboard_template.html")
-    html = open(template).read().replace(
-        "__DATA__", json.dumps(data, separators=(",", ":"))
+    template = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "dashboard_template.html"
+    )
+    html = (
+        open(template)
+        .read()
+        .replace("__DATA__", json.dumps(data, separators=(",", ":")))
     )
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     with open(args.out, "w") as fh:
