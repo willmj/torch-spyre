@@ -32,7 +32,7 @@ echo "=== nightly sweep $DAY started $STARTED ==="
 # status.json is the contract with the dashboard. Written on every path.
 status() {   # status <state> <detail>
     python3 - "$OUT/status.json" "$1" "$2" "$STARTED" "$GRAFT_BRANCH" "$TIER" <<'PY'
-import json, subprocess, sys, datetime
+import json, os, socket, subprocess, sys, datetime
 path, state, detail, started, graft, tier = sys.argv[1:7]
 def sh(*a):
     try:
@@ -50,6 +50,14 @@ json.dump({
     # night where nothing changed from a night that measured the wrong tree.
     "main_sha": sh("git", "rev-parse", "--short", "upstream/main"),
     "swept_sha": sh("git", "rev-parse", "--short", "HEAD"),
+    # Which machine. Every night is a fresh pod the scheduler may place anywhere,
+    # and the same tree compiles at measurably different speeds on different
+    # nodes -- by more than the changes this watches for. A time step with no
+    # counter step and a different node here is the node, not the compiler.
+    # NODE_NAME comes from the CronJob's downward API; a hand run has only the
+    # pod name, which is still enough to tell two runs apart.
+    "node": os.environ.get("NODE_NAME") or "",
+    "pod": os.environ.get("HOSTNAME") or socket.gethostname(),
 }, open(path, "w"), indent=1)
 PY
     echo "=== status: $1 ($2) ==="
@@ -58,6 +66,14 @@ PY
 cd "$REPO" 2>/dev/null || { mkdir -p "$OUT"; status failed "no checkout at $REPO; run setup_nightly.sh"; exit 1; }
 
 # ---- 1. graft (merge main in) --------------------------------------------
+# GRAFT=0 sweeps the checkout exactly as it stands, for the case the graft is
+# built for: a conflict was resolved by hand and the night should be measured on
+# that resolution rather than thrown away. Everything downstream is unchanged, so
+# the night lands in history like any other -- status.json still records the sha
+# that ran, which is what makes the resulting point readable later.
+if [ "${GRAFT:-1}" = "0" ]; then
+    echo "GRAFT=0: sweeping $REPO as it stands, at $(git rev-parse --short HEAD)"
+else
 # One conflict surface by design: the integration branch carries every piece of
 # instrumentation, and this rebases it onto today's main. async_compile.py has
 # conflicted three times in nine days, so the abort path is the common one.
@@ -94,6 +110,7 @@ if ! merge_err="$(git merge --no-edit upstream/main 2>&1)"; then
     exit 1
 fi
 echo "grafted $GRAFT_BRANCH onto main $(git rev-parse --short upstream/main)"
+fi
 
 # ---- 2. point at the grafted tree ----------------------------------------
 # No build. The dev venv is read for torch (2.13.0+cpu is a local-version wheel

@@ -98,6 +98,26 @@ sweep they varied **0.00%** between samples against **3.68%** for times. A step 
 `extractions/op` is a real change in what the compiler does; a 5% wobble in seconds
 is usually the pod.
 
+The first two nights put numbers on how much that matters. A point's own three
+samples spread **11% at the median and 63% at the worst**, which is larger than
+most night-over-night moves, while every counter spread 0.00% over the same
+samples. So the time chart plots the **fastest** sample, not the median, and draws
+the full sample range as a band behind it. Contamination of a compile is one-sided
+-- a neighbour on the node, a device retry or a cold page cache can only make a
+sample slower -- so the minimum is the order statistic that estimates the tree and
+not the machine. It is a real improvement and not a cure: switching from median to
+min cut the worst apparent night-over-night move from **110% to 42%**, and on the
+headline Granite point turned an apparent **+17.8% regression into -2.3%**, but 11
+of 26 points still moved more than 15%. Read a time move only when it clears the
+band, and confirm it against a counter before believing it.
+
+Two things make a time comparison meaningless regardless of estimator, and both
+are now recorded in `status.json` so they can be ruled out. A different **node**:
+each night is a fresh pod the scheduler may place anywhere. And the pod requests
+no CPU, so it is BestEffort and shares a 144-core node with whatever else is
+running -- a quiet night and a busy one are not the same measurement. Adding a
+`requests.cpu` would tighten this at the cost of possibly not scheduling at all.
+
 Regions are ranked by **self** time. An inclusive ranking puts every ancestor of the
 hot pass near 100% and says nothing, and the one region above half the total is
 excluded from the chart and reported in a tile instead -- otherwise every other bar
