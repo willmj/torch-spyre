@@ -19,13 +19,8 @@
     python3 tools/frontend_timing/summarize.py /tmp/records
     python3 tools/frontend_timing/summarize.py /tmp/records --passes --csv out.csv
 
-Median across samples, never mean: pod wall time has a long tail, and one contended
-sample should not move the number. Frontend time is a subtraction -- the compile region
-minus the backend invocations inside it -- because the backend runs per kernel from
-within codegen rather than after it.
-
-Records that never reached a compile are reported and excluded rather than averaged in:
-a process that died before compiling looks like a fast one otherwise.
+Medians across samples. Frontend time is the compile region minus the backend
+invocations inside it. Records that did not finish a compile are reported and excluded.
 """
 
 from __future__ import annotations
@@ -34,7 +29,6 @@ import argparse
 import csv
 import json
 import os
-import statistics
 import sys
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -49,42 +43,15 @@ COMPILE_EVENT = "stage:compile_fx:spyre_compile"
 BACKEND_EVENT = "stage:SpyreAsyncCompile:backend_compile"
 GRAPH_PIPELINE = "pipeline:CustomPreSchedulingPasses"
 
-#: Metadata keys that describe the run rather than the point being measured.
-_NON_PARAM_KEYS = frozenset(
-    {
-        "sample",
-        "cold",
-        "cache_dir",
-        "spyre_config",
-        "workload",
-        "recorder_version",
-        "clock",
-        "pid",
-        "git_sha",
-        "torch_spyre_path",
-        "torch_spyre_version",
-        "torch_version",
-        "python_version",
-        "frontend_only",
-        "backend_skipped_kernels",
-        "env_arm",
-        "compile_wall_ms",
-        "peak_rss_kb",
-        "kernels_skipped",
-    }
-)
+#: The FX-graph pipeline whose ``input_nodes`` is an FX node count. The node pipelines
+#: reuse that key for a *scheduler* node count, so taking a max over every pipeline
+#: would mix two different units into one metric.
+FX_PIPELINE = "pipeline:CustomPreGradPasses"
 
-#: Event ``meta`` keys that describe the graph rather than count analysis work. Anything
-#: else numeric on a pass or pipeline event is treated as a counter, so a counter added
-#: to the compiler shows up here without this file being edited.
+#: Event ``meta`` keys that describe the graph. Any other number on a pass event is a
+#: counter, so a counter added to the compiler shows up here with no edit.
 _GRAPH_META_KEYS = frozenset(
-    {
-        "input_operations",
-        "output_operations",
-        "input_nodes",
-        "output_nodes",
-        "passes",
-    }
+    "input_operations output_operations input_nodes output_nodes passes".split()
 )
 
 
@@ -107,60 +74,87 @@ class Record:
 
     @property
     def params(self) -> dict[str, Any]:
-        return {k: v for k, v in self.meta.items() if k not in _NON_PARAM_KEYS}
+        """The builder's resolved parameters, from their own metadata key.
+
+        A namespace rather than a denylist over the whole of ``meta``: the recorder's
+        contract is that readers tolerate unknown keys, so any key added to run
+        metadata would otherwise become a workload parameter -- renaming every point,
+        and splitting one point into single samples if the value varies per process.
+        """
+        params = self.meta.get("params")
+        return dict(params) if isinstance(params, dict) else {}
+
+    @property
+    def compiled(self) -> bool:
+        """Whether the child reported reaching the end of its compile.
+
+        Recorded by the driver rather than inferred from event errors. The recorder
+        stamps an error on any region an exception passed through, including ones a
+        caller deliberately swallows -- provenance collection does exactly that -- so
+        error-based exclusion drops successful compiles.
+        """
+        return self.meta.get("compiled") is True
 
     def total_ns(self, name: str) -> int:
         return sum(e["inclusive_ns"] for e in self.events if e["name"] == name)
+
+    def ran_backend(self) -> bool:
+        return any(e["name"] == BACKEND_EVENT for e in self.events)
 
     def backend_ns(self) -> int:
         return sum(e["inclusive_ns"] for e in self.events if e["name"] == BACKEND_EVENT)
 
     def graph_operations(self) -> int | None:
-        """Largest pre-scheduling graph this process compiled, or None if it had none.
-
-        None rather than 0: a record that never reached the pre-scheduling pipeline did
-        not compile a zero-operation graph, and a zero here would read as a graph that
-        shrank to nothing.
-        """
+        """Largest pre-scheduling graph compiled; None, not 0, if there was none."""
         sizes = [
-            e.get("meta", {}).get("input_operations", 0)
+            (e.get("meta") or {})["input_operations"]
             for e in self.events
             if e["name"] == GRAPH_PIPELINE
+            and "input_operations" in (e.get("meta") or {})
         ]
         return max(sizes) if sizes else None
 
     def graph_nodes(self) -> int | None:
-        """Largest FX graph this process compiled, or None if none reported one."""
+        """FX nodes entering the pre-grad pipeline, or None if it did not report.
+
+        Read from one named pipeline, not maxed over every pipeline: the node
+        pipelines put a *scheduler* node count under the same key, and a max over both
+        silently reports whichever unit happens to be larger.
+        """
         sizes = [
             (e.get("meta") or {})["input_nodes"]
             for e in self.events
-            if e["name"].startswith("pipeline:")
-            and "input_nodes" in (e.get("meta") or {})
+            if e["name"] == FX_PIPELINE and "input_nodes" in (e.get("meta") or {})
         ]
         return max(sizes) if sizes else None
 
     def counters(self) -> dict[str, int]:
-        """Analysis-call counts for the whole compile, summed over every pass.
+        """Work counts from pass and stage event metadata.
 
-        Summed rather than kept per pass on purpose: per-pass counters are in the raw
-        record for attribution work, but as dashboard metrics they would multiply every
-        counter by every pass, and a metric name set that grows like that stops being
-        low-cardinality.
+        Pass counts are summed under their bare key: they are per-pass instances of
+        the same measurement, and a compile total is what a dashboard wants. Stage
+        counts are keyed by their region instead, because two stages can carry the
+        same key for different things -- the scratchpad records ``buffers`` on more
+        than one region -- and summing those would report a number that is neither.
+
+        Pipelines are skipped: they repeat the totals of the passes inside them.
         """
         totals: dict[str, int] = {}
         for event in self.events:
-            if not event["name"].startswith(("pass:", "pipeline:")):
-                continue
-            # Pipelines carry the inclusive total of their own passes, so counting both
-            # would double everything; passes alone sum to the compile.
-            if event["name"].startswith("pipeline:"):
+            name = event["name"]
+            if name.startswith("pass:"):
+                prefix = ""
+            elif name.startswith("stage:"):
+                prefix = name[len("stage:") :].replace(":", ".") + "."
+            else:
                 continue
             for key, value in (event.get("meta") or {}).items():
                 if key in _GRAPH_META_KEYS or not isinstance(value, (int, float)):
                     continue
                 if isinstance(value, bool):
                     continue
-                totals[key] = totals.get(key, 0) + value
+                full = prefix + key
+                totals[full] = totals.get(full, 0) + value
         return totals
 
     def run_metrics(self) -> dict[str, float]:
@@ -199,21 +193,16 @@ class Record:
         return totals
 
 
-#: Version of the rows file. A consumer that does not know this string should refuse the
-#: file rather than guess, the way the recorder's own RECORDER_VERSION works.
+#: Rows-file version; a consumer that does not know it should refuse the file.
 ROWS_SCHEMA = "frontend-timing-rows/1"
 
 
 def metric_key(event_name: str) -> str:
-    """``stage:Owner:what`` -> ``stage.Owner.what_ms``.
+    """``stage:Owner:what`` -> ``stage.Owner.what_ms``, safe as a warehouse Map key.
 
-    One grammar for every metric name, because these become warehouse Map keys: dots
-    rather than colons so the names survive tools that treat a colon as a separator, and
-    a unit suffix so a reader never has to guess milliseconds from nanoseconds.
-
-    Each region also gets a ``..._self_ms`` sibling. Adding metric names is additive,
-    so a reader written against the older rows file keeps working -- it simply does
-    not see them.
+    Each region also gets a ``..._self_ms`` sibling. New metric names are additive, so
+    a reader written against an older rows file keeps working and simply does not see
+    them.
     """
     return event_name.replace(":", ".") + "_ms"
 
@@ -229,37 +218,59 @@ class PointSummary:
     samples: int
     measurements: dict[str, list[float]] = field(default_factory=dict)
 
-    def median(self, key: str) -> float:
+    def minimum(self, key: str) -> float | None:
+        """The least of this metric's samples, or None when nothing measured it.
+
+        The minimum rather than the median. Co-tenant interference on a shared pod
+        only ever makes a compile slower -- measured at 11% typical and 63% worst
+        spread across three samples of one point -- so the fastest sample is the one
+        least contaminated by it, and the long tail the median was chosen to resist is
+        the very thing being discarded. For a deterministic metric (a graph size, a
+        work count) every sample agrees and the choice does not arise.
+
+        None rather than 0.0 when absent: a metric nothing measured is not a zero.
+        """
         values = self.measurements.get(key)
-        return statistics.median(values) if values else 0.0
+        return min(values) if values else None
 
     @property
-    def graph_operations(self) -> int:
-        return int(self.median("graph_operations"))
+    def graph_operations(self) -> int | None:
+        value = self.minimum("graph_operations")
+        return None if value is None else int(value)
 
     @property
-    def total_ms(self) -> float:
-        return self.median("total_ms")
+    def total_ms(self) -> float | None:
+        return self.minimum("total_ms")
 
     @property
-    def backend_ms(self) -> float:
-        return self.median("backend_ms")
+    def backend_ms(self) -> float | None:
+        return self.minimum("backend_ms")
 
     @property
-    def frontend_ms(self) -> float:
-        # The median of the per-sample differences, not the difference of the two
-        # medians: the subtraction belongs inside one sample, where both numbers came
-        # from the same process.
-        return self.median("frontend_ms")
+    def frontend_ms(self) -> float | None:
+        # Of the per-sample differences, not a difference of two statistics: both
+        # sides of the subtraction must come from one process.
+        return self.minimum("frontend_ms")
+
+    def self_ms(self, region_key: str) -> float:
+        """The ``_self_ms`` sibling of an inclusive region key; 0.0 if absent."""
+        return self.minimum(region_key[:-3] + "_self_ms") or 0.0
 
     def regions_ms(self, prefix: str) -> dict[str, float]:
-        """Median ms per region name under ``prefix``, largest first."""
-        medians = {
-            key: self.median(key)
+        """Least inclusive ms per region under ``prefix``, ranked by self time.
+
+        The self siblings are not keys here -- they are the ranking. Inclusive time
+        sums to more than the compile, so ordering by it puts every ancestor of the
+        hot pass near the top and says nothing about where the cost is.
+        """
+        lows = {
+            key: self.minimum(key) or 0.0
             for key in self.measurements
-            if key.startswith(prefix) and key.endswith("_ms")
+            if key.startswith(prefix)
+            and key.endswith("_ms")
+            and not key.endswith("_self_ms")
         }
-        return dict(sorted(medians.items(), key=lambda kv: -kv[1]))
+        return dict(sorted(lows.items(), key=lambda kv: -self.self_ms(kv[0])))
 
 
 def point_name(workload: str, params: dict[str, Any], arm: str = "") -> str:
@@ -274,8 +285,7 @@ def point_name(workload: str, params: dict[str, Any], arm: str = "") -> str:
 def load_records(directory: str) -> tuple[list[Record], list[str]]:
     """Load every record in ``directory``. Returns (usable, problems).
 
-    Subdirectories are not walked, which is what keeps the driver's discarded warmup --
-    written to ``warmup/`` -- out of the summary.
+    Not recursive, which keeps the driver's discarded ``warmup/`` out of the summary.
     """
     records: list[Record] = []
     problems: list[str] = []
@@ -302,25 +312,19 @@ def load_records(directory: str) -> tuple[list[Record], list[str]]:
         if any(e.get("open") for e in record.events):
             problems.append(f"{entry}: written mid-region, excluded")
             continue
-        failed = [e["name"] for e in record.events if e.get("error")]
-        if failed:
-            # The recorder dumps at process exit whether or not the compile succeeded,
-            # so a failed sample leaves a record whose times measure a failure.
-            problems.append(f"{entry}: compile failed in {failed[0]}, excluded")
+        if not record.compiled:
+            # The recorder writes at exit even when the compile raised, so a record
+            # exists either way and the driver's own verdict is what separates them.
+            failed = [e["name"] for e in record.events if e.get("error")]
+            where = f" ({failed[0]})" if failed else ""
+            problems.append(f"{entry}: compile did not complete{where}, excluded")
             continue
         records.append(record)
     return records, problems
 
 
 def measurements(group: list[Record]) -> dict[str, list[float]]:
-    """Every metric for one point, as its per-sample values.
-
-    Arrays, not medians: the warehouse column is ``Map(String, Array(Float64))``,
-    deliberately, so variance and percentiles stay recomputable downstream. The medians
-    in the human-facing table are taken from these. A metric only some samples carry
-    yields a shorter array rather than a padded one -- an absent measurement must not
-    read as a zero.
-    """
+    """Every metric for one point, as per-sample values; an absent one is not a zero."""
     series: dict[str, list[float]] = {}
 
     def add(key: str, value: float) -> None:
@@ -330,7 +334,10 @@ def measurements(group: list[Record]) -> dict[str, list[float]]:
         total = record.total_ns(COMPILE_EVENT)
         backend = record.backend_ns()
         add("total_ms", total / 1e6)
-        add("backend_ms", backend / 1e6)
+        # Omitted, not zero, when the backend was skipped: a 0 ms backend and a backend
+        # that never ran are different facts, and only one of them is a measurement.
+        if record.ran_backend():
+            add("backend_ms", backend / 1e6)
         add("frontend_ms", (total - backend) / 1e6)
         for key, size in (
             ("graph_operations", record.graph_operations()),
@@ -342,8 +349,7 @@ def measurements(group: list[Record]) -> dict[str, list[float]]:
             for name, ns in record.self_by_prefix(prefix).items():
                 add(metric_key(name)[:-3] + "_self_ms", ns / 1e6)
         for name, ns in record.by_prefix("stage:").items():
-            # The compile root is already total_ms; recording it twice would let a
-            # careless sum double the whole compile.
+            # Already total_ms, so a sum over stage.* must not see it again.
             if name == COMPILE_EVENT:
                 continue
             add(metric_key(name), ns / 1e6)
@@ -361,38 +367,46 @@ def summarize(records: list[Record]) -> list[PointSummary]:
     for record in records:
         key = point_name(record.workload, record.params, record.arm)
         grouped.setdefault(key, []).append(record)
-
-    summaries = []
-    for point, group in sorted(grouped.items()):
-        summaries.append(
-            PointSummary(
-                point=point,
-                workload=group[0].workload,
-                params=group[0].params,
-                arm=group[0].arm,
-                samples=len(group),
-                measurements=measurements(group),
-            )
+    return [
+        PointSummary(
+            point=point,
+            workload=group[0].workload,
+            params=group[0].params,
+            arm=group[0].arm,
+            samples=len(group),
+            measurements=measurements(group),
         )
-    return summaries
+        for point, group in sorted(grouped.items())
+    ]
+
+
+#: Metadata that must agree across every record in a summary. A sweep writes one file
+#: per sample with the pid in its name, so nothing is ever replaced and a second sweep
+#: into the same directory silently doubles each point's samples with the earlier
+#: build's. Disagreement here is that situation, reported rather than averaged.
+_IDENTITY_KEYS = ("git_sha", "torch_version", "torch_spyre_version")
+
+
+def identity_conflicts(records: list[Record]) -> list[str]:
+    """Keys on which these records disagree, with the values they disagree on."""
+    conflicts = []
+    for key in _IDENTITY_KEYS + ("spyre_config",):
+        seen = {json.dumps(r.meta.get(key), sort_keys=True) for r in records}
+        if len(seen) > 1:
+            shown = ", ".join(sorted(s[:60] for s in seen)[:3])
+            conflicts.append(f"{key} differs across records: {shown}")
+    return conflicts
 
 
 def provenance(records: list[Record]) -> dict[str, Any]:
-    """What produced these numbers, so a row can be attributed to a commit.
-
-    Read off the first record rather than from the environment: the sweep may be
-    summarized on a different machine from the one that ran it, and the record is the
-    only thing that knows which checkout compiled.
-    """
+    """Build identity, read off the first record: it may be summarized elsewhere."""
     first = records[0].meta if records else {}
-    keys = (
-        "git_sha",
-        "torch_version",
-        "torch_spyre_version",
-        "python_version",
-        "recorder_version",
-    )
-    return {key: first.get(key) for key in keys if first.get(key) is not None}
+    keys = "git_sha torch_version torch_spyre_version python_version recorder_version"
+    return {key: first.get(key) for key in keys.split() if first.get(key) is not None}
+
+
+def _cell(value: float | int | None, fmt: str = "{:.1f}") -> str:
+    return "-" if value is None else fmt.format(value)
 
 
 def render_markdown(
@@ -403,64 +417,56 @@ def render_markdown(
         "|---|--:|--:|--:|--:|--:|",
     ]
     for s in summaries:
-        lines.append(
-            f"| {s.point} | {s.graph_operations} | {s.frontend_ms:.1f} | "
-            f"{s.backend_ms:.1f} | {s.total_ms:.1f} | {s.samples} |"
-        )
+        # "-" for a metric nothing measured. Printing 0 would read as a graph that
+        # shrank to nothing, or a backend that ran instantly rather than not at all.
+        cells = [
+            s.point,
+            _cell(s.graph_operations, "{:.0f}"),
+            _cell(s.frontend_ms),
+            _cell(s.backend_ms),
+            _cell(s.total_ms),
+            str(s.samples),
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
     if not passes:
         return "\n".join(lines)
 
     for s in summaries:
-        lines += ["", f"### {s.point}", "", "| region | ms |", "|---|--:|"]
+        # Both columns, because neither answers the other's question: inclusive is
+        # what the frontend subtraction uses and what shows the nesting, self is what
+        # ranks cost. Rows are ordered by self for that reason.
+        header = "| region | ms | self ms |"
+        lines += ["", f"### {s.point}", "", header, "|---|--:|--:|"]
         for name, ms in s.regions_ms("stage.").items():
-            lines.append(f"| {name} | {ms:.1f} |")
+            lines.append(f"| {name} | {ms:.1f} | {s.self_ms(name):.1f} |")
         ranked = list(s.regions_ms("pass.").items())
         for name, ms in ranked[:top]:
-            lines.append(f"| {name} | {ms:.1f} |")
+            lines.append(f"| {name} | {ms:.1f} | {s.self_ms(name):.1f} |")
         if len(ranked) > top:
-            # Say so rather than let a reader think the list is the whole pipeline; the
-            # rows file and the CSV carry every pass.
-            lines.append(f"| ...{len(ranked) - top} more passes (see --csv/--json) | |")
+            lines.append(
+                f"| ...{len(ranked) - top} more passes (see --csv/--json) | | |"
+            )
     return "\n".join(lines)
 
 
 def write_csv(summaries: list[PointSummary], path: str) -> None:
-    """One row per metric, carrying the point's graph size.
+    """One row per metric, each with the point's graph size so plots need no join.
 
-    Graph size travels with every row so per-region time can be plotted against it
-    without joining back to another table. Region names use the same grammar as the rows
-    file, so the two can be compared without translating between vocabularies.
+    The value column is named ``minimum`` rather than carrying a unit: the metric name
+    already says milliseconds or a count, and the old ``median_ms`` was wrong on both
+    halves once counts and byte sizes joined the table.
     """
     with open(path, "w", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(
-            [
-                "point",
-                "workload",
-                "params",
-                "arm",
-                "graph_operations",
-                "region",
-                "median_ms",
-                "samples",
-            ]
-        )
+        header = "point workload params arm graph_operations region minimum samples"
+        writer.writerow(header.split())
         for s in summaries:
             params = json.dumps(s.params, sort_keys=True)
+            ops = "" if s.graph_operations is None else s.graph_operations
             for region in sorted(s.measurements):
                 values = s.measurements[region]
-                writer.writerow(
-                    [
-                        s.point,
-                        s.workload,
-                        params,
-                        s.arm,
-                        s.graph_operations,
-                        region,
-                        f"{statistics.median(values):.3f}",
-                        len(values),
-                    ]
-                )
+                row = [s.point, s.workload, params, s.arm, ops, region]
+                writer.writerow(row + [f"{min(values):.3f}", len(values)])
 
 
 def write_json(
@@ -469,13 +475,7 @@ def write_json(
     path: str,
     tier: str | None = None,
 ) -> None:
-    """The rows file: one object per point, every metric as its per-sample values.
-
-    This is the shape the warehouse wants -- one ``benchmark_runs`` row per point, with
-    ``measurements`` a metric-name to sample-array map -- so the follow-up ingest is a
-    translation with no arithmetic in it. Keeping the arithmetic here, where it can be
-    tested without a database, is the point.
-    """
+    """The rows file: one object per point, every metric as its per-sample values."""
     payload = {
         "schema": ROWS_SCHEMA,
         "meta": {
@@ -511,6 +511,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--top", type=int, default=12, help="passes shown per point with --passes (12)"
     )
+    parser.add_argument(
+        "--allow-mixed",
+        action="store_true",
+        help="summarize records that disagree on build or configuration",
+    )
     args = parser.parse_args(argv)
 
     records, problems = load_records(args.records)
@@ -518,6 +523,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"skipped {problem}", file=sys.stderr)
     if not records:
         print("no usable records", file=sys.stderr)
+        return 1
+
+    conflicts = identity_conflicts(records)
+    if conflicts and not args.allow_mixed:
+        for conflict in conflicts:
+            print(f"error: {conflict}", file=sys.stderr)
+        print(
+            "refusing to summarize records from more than one build or configuration; "
+            "sweep into a fresh --out, or pass --allow-mixed if this is deliberate",
+            file=sys.stderr,
+        )
         return 1
 
     summaries = summarize(records)

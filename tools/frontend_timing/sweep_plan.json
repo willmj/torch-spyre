@@ -1,5 +1,5 @@
 {
-  "note": "Frontend-compile sweep. One entry per point; every key but 'workload', 'tiers', 'env' and 'comment' is passed to the workload builder. Each family holds all dimensions still except one, so a point series isolates a single scaling axis -- scaling.py finds those series by that rule, and a point that moves two axes at once yields no fit. Shapes only, no measured times. 'tiers' selects cadence (pr | nightly | weekly); a point with no 'tiers' runs in every tier. TIER MEMBERSHIP IS PROVISIONAL until calibrated on real hardware -- see the README. granite_* points carry Granite 3.3 8B's dimensions (hidden 4096, 32 query heads over 8 key/value heads of 128, intermediate 12800, stick-padded vocab 49159); transformer_block and mlp keep Llama-3.1-8B's (intermediate 14336) as the continuity point for baselines already taken.",
+  "note": "One point per line. Every key except workload, tiers, env and comment is passed to the workload's builder. See README.md for tiers and arms.",
   "points": [
     {
       "workload": "granite_layer",
@@ -16,7 +16,8 @@
         "nightly",
         "weekly"
       ],
-      "S": 1
+      "S": 1,
+      "comment": "decode. max_seqlen_q == 1 takes its own branch in the SDPA decomposition, so this point is coverage of that branch and does not belong to a power-law fit with the prefill points."
     },
     {
       "workload": "granite_layer",
@@ -423,10 +424,10 @@
         "nightly",
         "weekly"
       ],
-      "M": 8,
-      "K": 12,
-      "N": 6,
-      "tile": 2
+      "M": 256,
+      "K": 256,
+      "N": 64,
+      "tile": 64
     },
     {
       "workload": "granite_layer",
@@ -455,11 +456,11 @@
       "tiers": [
         "weekly"
       ],
-      "S": 512,
+      "S": 1,
       "env": {
         "SPYRE_LX_SOLVER_RELAYOUT_GROUPS_PER_EDGE": "0"
       },
-      "comment": "unbounded relayout enumeration. config.py records 5789 copies and a presolve that outlived the time limit on a 16-block decode graph, so this arm is the documented pathological case."
+      "comment": "unbounded relayout enumeration, on a DECODE shape. config.py records the 5789-copy blowup and the presolve that outlived its limit on a decode graph with unrolled KV blocks, so the arm has to run at S=1 to be the case it cites."
     }
   ]
 }

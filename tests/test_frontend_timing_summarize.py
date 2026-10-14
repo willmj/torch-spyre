@@ -13,14 +13,9 @@
 # limitations under the License.
 
 
-"""Tests for the frontend timing summarizer (tools/frontend_timing/summarize.py).
+"""Tests for tools/frontend_timing/summarize.py, loaded by path since it is a script.
 
-Loaded by path rather than imported: the tool is a script, not a package, and it depends
-on nothing but the standard library.
-
-Deliberately outside tests/inductor/, whose session fixtures touch the Spyre device: the
-summarizer is pure JSON handling, and a tool test that needs no hardware should not
-require any.
+Outside tests/inductor/, whose session fixtures touch the Spyre device.
 """
 
 import csv
@@ -60,9 +55,11 @@ def _record(
     compile_ms=100.0,
     backend_ms=0.0,
     ops=42,
+    pipeline=True,
     passes=None,
     extra_events=None,
     meta=None,
+    compiled=True,
 ):
     """Write one synthetic record and return its path."""
     ms = 1_000_000
@@ -74,15 +71,18 @@ def _record(
             "inclusive_ns": int(compile_ms * ms),
             "self_ns": int(compile_ms * ms),
         },
-        {
-            "name": summarize_mod.GRAPH_PIPELINE,
-            "ordinal": 1,
-            "parent_ordinal": 0,
-            "inclusive_ns": int(compile_ms * ms * 0.5),
-            "self_ns": 0,
-            "meta": {"input_operations": ops, "output_operations": ops},
-        },
     ]
+    if pipeline:
+        events.append(
+            {
+                "name": summarize_mod.GRAPH_PIPELINE,
+                "ordinal": 1,
+                "parent_ordinal": 0,
+                "inclusive_ns": int(compile_ms * ms * 0.5),
+                "self_ns": 0,
+                "meta": {"input_operations": ops, "output_operations": ops},
+            }
+        )
     if backend_ms:
         events.append(
             {
@@ -91,7 +91,7 @@ def _record(
                 "parent_ordinal": 0,
                 "inclusive_ns": int(backend_ms * ms),
                 "self_ns": int(backend_ms * ms),
-                "meta": {"tool": "dxp_standalone"},
+                "meta": {"tool": "dbo-opt"},
             }
         )
     for index, (pass_name, pass_ms) in enumerate((passes or {}).items()):
@@ -112,7 +112,8 @@ def _record(
             "workload": workload,
             "sample": 1,
             "cold": True,
-            **(params or {}),
+            "compiled": compiled,
+            "params": dict(params or {}),
             **(meta or {}),
         },
         "events": events,
@@ -120,6 +121,13 @@ def _record(
     path = tmp_path / name
     path.write_text(json.dumps(payload))
     return path
+
+
+def _summary(tmp_path):
+    """The single point summarized from ``tmp_path``."""
+    records, _ = summarize_mod.load_records(str(tmp_path))
+    (summary,) = summarize_mod.summarize(records)
+    return summary
 
 
 class TestLoading:
@@ -162,10 +170,33 @@ class TestLoading:
         assert records == []
         assert any("mid-region" in p for p in problems)
 
-    def test_failed_compile_is_excluded(self, tmp_path):
+    def test_a_swallowed_error_does_not_exclude_a_successful_compile(self, tmp_path):
+        # The recorder stamps an error on any region an exception passed through, even
+        # one the caller swallows -- provenance collection does exactly that. Excluding
+        # on that dropped successful compiles.
+        _record(
+            tmp_path,
+            "swallowed.json",
+            extra_events=[
+                {
+                    "name": "stage:SpyreAsyncCompile:kernel_provenance",
+                    "ordinal": 4,
+                    "parent_ordinal": 1,
+                    "inclusive_ns": 1_000_000,
+                    "self_ns": 1_000_000,
+                    "error": "KeyError: 'origins'",
+                }
+            ],
+        )
+        records, problems = summarize_mod.load_records(str(tmp_path))
+        assert len(records) == 1
+        assert problems == []
+
+    def test_a_compile_that_did_not_complete_is_excluded(self, tmp_path):
         _record(
             tmp_path,
             "failed.json",
+            compiled=False,
             extra_events=[
                 {
                     "name": "pass:CustomPreSchedulingPasses:span_reduction",
@@ -182,7 +213,9 @@ class TestLoading:
         # A record is written at process exit even when the compile raised, and those
         # times measure a failure rather than a compile.
         assert len(records) == 1
-        assert any("compile failed" in p for p in problems)
+        assert any("did not complete" in p for p in problems)
+        # The erroring region is still named, as a pointer to what went wrong.
+        assert any("span_reduction" in p for p in problems)
 
     def test_unreadable_record_is_reported_not_fatal(self, tmp_path):
         (tmp_path / "broken.json").write_text("{not json")
@@ -197,21 +230,20 @@ class TestLoading:
 
 
 class TestSummary:
-    def test_medians_across_samples(self, tmp_path):
+    def test_minimum_across_samples(self, tmp_path):
         for index, ms in enumerate((100.0, 400.0, 200.0)):
             _record(tmp_path, f"s{index}.json", params={"layers": 2}, compile_ms=ms)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
-        # Median, not mean: the mean here would be 233.3.
-        assert summary.total_ms == pytest.approx(200.0)
+        # The minimum: co-tenant interference only ever makes a compile slower, so the
+        # fastest sample is the least contaminated one. Median would be 200, mean 233.
+        assert summary.total_ms == pytest.approx(100.0)
         assert summary.samples == 3
         assert summary.point == "mlp-layers2"
 
     def test_frontend_is_total_minus_backend(self, tmp_path):
         _record(tmp_path, "s.json", compile_ms=500.0, backend_ms=200.0)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         assert summary.total_ms == pytest.approx(500.0)
         assert summary.backend_ms == pytest.approx(200.0)
@@ -219,9 +251,10 @@ class TestSummary:
 
     def test_frontend_only_records_have_no_backend_share(self, tmp_path):
         _record(tmp_path, "s.json", compile_ms=500.0, meta={"frontend_only": True})
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
-        assert summary.backend_ms == 0.0
+        summary = _summary(tmp_path)
+        # Absent, not zero: a skipped backend and a 0 ms backend are different facts.
+        assert summary.backend_ms is None
+        assert "backend_ms" not in summary.measurements
         assert summary.frontend_ms == pytest.approx(500.0)
 
     def test_points_are_grouped_by_workload_and_parameters(self, tmp_path):
@@ -243,16 +276,14 @@ class TestSummary:
             params={"layers": 2},
             meta={"git_sha": "abc1234", "pid": 999, "torch_version": "2.13.0"},
         )
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
         # Otherwise every sample lands in its own point and nothing has a median.
         assert summary.params == {"layers": 2}
         assert summary.point == "mlp-layers2"
 
     def test_graph_size_comes_from_the_pipeline_event(self, tmp_path):
         _record(tmp_path, "s.json", ops=260)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
         assert summary.graph_operations == 260
 
     def test_passes_and_buckets_are_collected_by_prefix(self, tmp_path):
@@ -262,8 +293,7 @@ class TestSummary:
             passes={"span_reduction": 30.0, "deadcode_elimination": 5.0},
             backend_ms=10.0,
         )
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         span = "pass.CustomPreSchedulingPasses.span_reduction_ms"
         passes_ms = summary.regions_ms("pass.")
@@ -308,18 +338,16 @@ class TestMeasurements:
     def test_metrics_are_arrays_of_samples_not_medians(self, tmp_path):
         _record(tmp_path, "a.json", compile_ms=100.0)
         _record(tmp_path, "b.json", compile_ms=300.0)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         # Both samples survive: benchmark_runs.measurements is an array per metric so
         # variance stays recomputable, and a median here would throw that away.
         assert sorted(summary.measurements["total_ms"]) == [100.0, 300.0]
-        assert summary.total_ms == 200.0
+        assert summary.total_ms == 100.0
 
     def test_metric_names_follow_the_grammar(self, tmp_path):
         _record(tmp_path, "a.json", passes={"span_reduction": 30.0}, backend_ms=10.0)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         keys = summary.measurements
         assert "pass.CustomPreSchedulingPasses.span_reduction_ms" in keys
@@ -329,8 +357,7 @@ class TestMeasurements:
 
     def test_the_compile_root_is_not_also_a_stage_metric(self, tmp_path):
         _record(tmp_path, "a.json", compile_ms=100.0)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         # It is already total_ms; emitting it twice would let a careless sum over
         # stage.* double the entire compile.
@@ -341,19 +368,17 @@ class TestMeasurements:
     def test_frontend_is_subtracted_inside_each_sample(self, tmp_path):
         _record(tmp_path, "a.json", compile_ms=100.0, backend_ms=40.0)
         _record(tmp_path, "b.json", compile_ms=300.0, backend_ms=100.0)
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         # 60 and 200, then the median -- not median(total) - median(backend), which
         # would pair numbers from two different processes.
         assert sorted(summary.measurements["frontend_ms"]) == [60.0, 200.0]
-        assert summary.frontend_ms == 130.0
+        assert summary.frontend_ms == 60.0
 
     def test_a_metric_only_one_sample_carries_stays_short(self, tmp_path):
         _record(tmp_path, "a.json", passes={"span_reduction": 30.0})
         _record(tmp_path, "b.json")
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         # Padding the absent sample with a zero would report a 50% improvement that
         # never happened.
@@ -382,8 +407,7 @@ class TestCounters:
             "a.json",
             extra_events=[self._counting_pass(**{"read_writes.extractions": 900})],
         )
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         # Generic on purpose: a counter added to the compiler must appear here without
         # this file or summarize.py being edited.
@@ -391,8 +415,7 @@ class TestCounters:
 
     def test_graph_sizes_are_not_mistaken_for_counters(self, tmp_path):
         _record(tmp_path, "a.json", extra_events=[self._counting_pass()])
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         assert not [k for k in summary.measurements if "counter.input_operations" in k]
         assert not [k for k in summary.measurements if "counter.output_operations" in k]
@@ -402,8 +425,7 @@ class TestCounters:
         second = dict(self._counting_pass(**{"read_writes.misses": 7}), ordinal=21)
         second["name"] = "pass:CustomPreSchedulingPasses:span_reduction"
         _record(tmp_path, "a.json", extra_events=[first, second])
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         assert summary.measurements["counter.read_writes.misses"] == [12.0]
 
@@ -427,8 +449,7 @@ class TestArmsAndRunMetrics:
 
     def test_the_arm_is_not_treated_as_a_workload_parameter(self, tmp_path):
         _record(tmp_path, "a.json", params={"S": 512}, meta={"env_arm": "SENCORES=1"})
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
         assert summary.params == {"S": 512}
 
     def test_run_level_metrics_are_collected(self, tmp_path):
@@ -441,8 +462,7 @@ class TestArmsAndRunMetrics:
                 "kernels_skipped": 17,
             },
         )
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
 
         assert summary.measurements["peak_rss_kb"] == [2_500_000.0]
         assert summary.measurements["compile_wall_ms"] == [3610.0]
@@ -490,30 +510,15 @@ class TestAbsentIsNotZero:
     ):
         # Only the compile root, so nothing ever reported a graph. A 0 here would read
         # as a graph that shrank to nothing, which on a delta is a total regression.
-        path = tmp_path / "bare.json"
-        path.write_text(
-            json.dumps(
-                {
-                    "meta": {"workload": "mlp", "sample": 1},
-                    "events": [
-                        {
-                            "name": summarize_mod.COMPILE_EVENT,
-                            "ordinal": 0,
-                            "parent_ordinal": None,
-                            "inclusive_ns": 100_000_000,
-                            "self_ns": 100_000_000,
-                        }
-                    ],
-                }
-            )
-        )
+        _record(tmp_path, "bare.json", pipeline=False)
         records, problems = summarize_mod.load_records(str(tmp_path))
         assert problems == []
         (summary,) = summarize_mod.summarize(records)
         assert "graph_operations" not in summary.measurements
         assert "graph_nodes" not in summary.measurements
-        # The table still has something to print.
-        assert summary.graph_operations == 0
+        assert summary.graph_operations is None
+        # ...and the table prints a dash rather than inventing a zero.
+        assert "| - |" in summarize_mod.render_markdown([summary])
 
     def test_graph_nodes_comes_from_a_pipeline_that_reported_one(self, tmp_path):
         _record(
@@ -530,8 +535,100 @@ class TestAbsentIsNotZero:
                 }
             ],
         )
-        records, _ = summarize_mod.load_records(str(tmp_path))
-        (summary,) = summarize_mod.summarize(records)
+        summary = _summary(tmp_path)
         assert summary.measurements["graph_nodes"] == [77.0]
         # 'passes' is a graph descriptor, not an analysis count.
         assert "counter.passes" not in summary.measurements
+
+
+class TestStageCounters:
+    """Counts on stage regions, which the README's add-a-metric recipe produces."""
+
+    @staticmethod
+    def _stage(name, ordinal, **meta):
+        return {
+            "name": name,
+            "ordinal": ordinal,
+            "parent_ordinal": 0,
+            "inclusive_ns": 1_000_000,
+            "self_ns": 1_000_000,
+            "meta": meta,
+        }
+
+    def test_a_count_on_a_stage_region_is_collected(self, tmp_path):
+        # The README tells a contributor to wrap a region in stage(...) and put counts
+        # in its meta, and says the summarizer needs no change. It did.
+        _record(
+            tmp_path,
+            "a.json",
+            extra_events=[
+                self._stage("stage:Scratchpad:cpsat_solve", 30, variables=1200)
+            ],
+        )
+        summary = _summary(tmp_path)
+        key = "counter.Scratchpad.cpsat_solve.variables"
+        assert summary.measurements[key] == [1200.0]
+
+    def test_stage_counts_are_keyed_by_region_not_merged(self, tmp_path):
+        # Two regions can carry the same key for different things -- the scratchpad
+        # records `buffers` on more than one -- and summing them reports neither.
+        _record(
+            tmp_path,
+            "a.json",
+            extra_events=[
+                self._stage("stage:Scratchpad:prepare_buffers", 30, buffers=40),
+                self._stage("stage:Scratchpad:cpsat_solve", 31, buffers=7),
+            ],
+        )
+        summary = _summary(tmp_path)
+        prepare = "counter.Scratchpad.prepare_buffers.buffers"
+        solve = "counter.Scratchpad.cpsat_solve.buffers"
+        assert summary.measurements[prepare] == [40.0]
+        assert summary.measurements[solve] == [7.0]
+        assert "counter.buffers" not in summary.measurements
+
+    def test_pass_counts_still_sum_under_their_bare_key(self, tmp_path):
+        first = {
+            "name": "pass:CustomPreSchedulingPasses:a",
+            "ordinal": 40,
+            "parent_ordinal": 1,
+            "inclusive_ns": 1_000_000,
+            "self_ns": 1_000_000,
+            "meta": {"read_writes.misses": 5},
+        }
+        second = dict(first, ordinal=41, name="pass:CustomPreSchedulingPasses:b")
+        _record(tmp_path, "a.json", extra_events=[first, second])
+        summary = _summary(tmp_path)
+        # Per-pass instances of one measurement; a compile total is what is wanted.
+        assert summary.measurements["counter.read_writes.misses"] == [10.0]
+
+
+class TestIdentityConflicts:
+    def test_records_from_one_build_have_no_conflict(self, tmp_path):
+        for name in ("a.json", "b.json"):
+            _record(tmp_path, name, meta={"git_sha": "abc1234"})
+        records, _ = summarize_mod.load_records(str(tmp_path))
+        assert summarize_mod.identity_conflicts(records) == []
+
+    def test_two_builds_in_one_directory_are_detected(self, tmp_path):
+        _record(tmp_path, "old.json", meta={"git_sha": "aaaaaaa"})
+        _record(tmp_path, "new.json", meta={"git_sha": "bbbbbbb"})
+        records, _ = summarize_mod.load_records(str(tmp_path))
+        conflicts = summarize_mod.identity_conflicts(records)
+        assert any("git_sha" in c for c in conflicts)
+
+    def test_a_differing_config_is_detected(self, tmp_path):
+        _record(tmp_path, "a.json", meta={"spyre_config": {"sencores": 32}})
+        _record(tmp_path, "b.json", meta={"spyre_config": {"sencores": 1}})
+        records, _ = summarize_mod.load_records(str(tmp_path))
+        # The arm facility sets config deliberately and labels it; an unlabelled
+        # difference means a stray export changed the compile.
+        conflicts = summarize_mod.identity_conflicts(records)
+        assert any("spyre_config" in c for c in conflicts)
+
+    def test_main_refuses_mixed_records_unless_told_otherwise(self, tmp_path, capsys):
+        _record(tmp_path, "old.json", meta={"git_sha": "aaaaaaa"})
+        _record(tmp_path, "new.json", meta={"git_sha": "bbbbbbb"})
+        assert summarize_mod.main([str(tmp_path)]) == 1
+        assert "refusing to summarize" in capsys.readouterr().err
+        assert summarize_mod.main([str(tmp_path), "--allow-mixed"]) == 0

@@ -19,27 +19,9 @@
     python3 tools/frontend_timing/run_sweep.py --plan .../sweep_plan.json
     python3 tools/frontend_timing/run_sweep.py --workload mlp -p seq_len=128 -p layers=2
 
-ONE PROCESS PER SAMPLE, and that is the whole reason this is a driver rather than a
-loop. ``TORCHINDUCTOR_CACHE_DIR`` is read at import, so no in-process cache reset gives
-a sample a cache directory that never held this graph. A fresh child with a fresh
-directory does.
-
-Each point gets a discarded warmup plus ``--samples`` measured runs, run serially --
-the Spyre device is exclusive per process, and a parallel sweep would measure
-contention. Records land wherever ``--out`` says; this script commits nothing and knows
-no repository path.
-
-Backend compilation is skipped by default (``TORCH_SPYRE_FRONTEND_ONLY=1``) because it
-dominates wall time and is not what this measures. Pass ``--with-backend`` for a point
-where the backend share itself is the question.
-
-A plan point may carry ``tiers`` and ``env``. ``--tier NAME`` runs only the points that
-declare it, which is how one plan serves a per-PR lane, a nightly lane and a weekly lane
-without three files drifting apart; a point with no ``tiers`` runs in every tier.
-``env`` sets environment for that point's children only, which is the A/B facility: the
-only way to measure two configurations against one tree. The CP-SAT evidence behind the
-complexity audit was taken before that optimization became the default, so re-running
-both arms matters.
+Every sample, warmup included, is a fresh process with a fresh Inductor cache, because
+``TORCHINDUCTOR_CACHE_DIR`` is read at import. Samples run serially: the device is
+exclusive per process.
 """
 
 from __future__ import annotations
@@ -49,6 +31,7 @@ import json
 import os
 import resource
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -58,28 +41,18 @@ from typing import Any
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-#: Where records go when nothing says otherwise. Matches tools/cost_model/records.py:
-#: an explicit path wins, then the environment, then a directory beside this file.
+#: Consulted after --out and before records/ beside this file, as in
+#: tools/cost_model/records.py.
 DEFAULT_RECORDS_ENV = "SPYRE_FRONTEND_TIMING_RECORDS"
 
 
 def resolve_out_dir(explicit: str | None) -> str:
-    if explicit:
-        return explicit
     from_env = os.environ.get(DEFAULT_RECORDS_ENV)
-    if from_env:
-        return from_env
-    return os.path.join(_HERE, "records")
+    return explicit or from_env or os.path.join(_HERE, "records")
 
 
-#: Plan keys that configure the sweep rather than the workload. Everything else in a
-#: point is a builder keyword, so a new key here must also be added to this set or the
-#: child will reject it as an unexpected argument.
+#: Plan keys that configure the sweep; every other key is a builder keyword.
 RESERVED_PLAN_KEYS = frozenset({"workload", "tiers", "env", "comment"})
-
-#: Carries the resolved A/B arm to the child, which records it so a summary can tell two
-#: arms of one point apart instead of averaging them together.
-ARM_ENV_VAR = "SPYRE_FTS_ENV_ARM"
 
 
 @dataclass
@@ -89,7 +62,6 @@ class Point:
     workload: str
     params: dict[str, Any] = field(default_factory=dict)
     env: dict[str, str] = field(default_factory=dict)
-    tiers: tuple[str, ...] = ()
 
     @property
     def arm(self) -> str:
@@ -111,12 +83,28 @@ def parse_params(pairs: list[str]) -> dict[str, Any]:
     return params
 
 
-def point_id(workload: str, params: dict[str, Any], arm: str = "") -> str:
-    """A filesystem-safe, order-independent name for one sweep point.
+def existing_records(out_dir: str) -> list[str]:
+    """Record files already in ``out_dir``, warmups included."""
+    found = []
+    for directory in (out_dir, os.path.join(out_dir, "warmup")):
+        if os.path.isdir(directory):
+            found += [e for e in os.listdir(directory) if e.endswith(".json")]
+    return found
 
-    The arm is part of the name: without it two arms of the same point write to the same
-    record filename and the second silently overwrites the first.
-    """
+
+def parse_env(pairs: list[str]) -> dict[str, str]:
+    """``KEY=VALUE`` strings as environment, values left exactly as written."""
+    env: dict[str, str] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise SystemExit(f"--env expects KEY=VALUE, got {pair!r}")
+        key, _, value = pair.partition("=")
+        env[key] = value
+    return env
+
+
+def point_id(workload: str, params: dict[str, Any], arm: str = "") -> str:
+    """A filesystem-safe, order-independent name for one point, arm included."""
     name = workload
     if params:
         name += "-" + "_".join(f"{k}{params[k]}" for k in sorted(params))
@@ -130,12 +118,15 @@ def point_id(workload: str, params: dict[str, Any], arm: str = "") -> str:
 # Worker: one cold compile, one record.
 
 
-def run_sample(workload: str, params: dict[str, Any], sample: int) -> int:
+def run_sample(workload: str, params: dict[str, Any], sample: int, arm: str) -> int:
     import torch
     from torch_spyre._inductor import config, timing_recorder
 
-    # Resolves because main() put the repository root on sys.path before calling here.
-    from tools.frontend_timing import workloads
+    # A plain import of the module beside this file, not `tools.frontend_timing`:
+    # `tools` is a namespace package here, so any installed `tools` package on
+    # sys.path would win, and putting the repository root on sys.path to reach it
+    # also shadows an installed torch_spyre with source that has no _C.
+    import workloads
 
     built = workloads.build(workload, **params)
     timing_recorder.set_run_meta(
@@ -144,50 +135,52 @@ def run_sample(workload: str, params: dict[str, Any], sample: int) -> int:
         cold=True,
         cache_dir=os.environ.get("TORCHINDUCTOR_CACHE_DIR", ""),
         spyre_config=_config_snapshot(config),
-        env_arm=os.environ.get(ARM_ENV_VAR, ""),
-        **built.params,
+        env_arm=arm,
+        # Their own key, not spread into run metadata: the recorder's contract is that
+        # readers tolerate unknown keys, so a reader that recovered parameters by
+        # excluding known ones would adopt every future run-metadata key as a
+        # parameter.
+        params=dict(built.params),
     )
 
-    # fullgraph: a graph break would split one measurement across two compiles and
-    # quietly change what is being timed. The control-flow workload needs it outright --
-    # without it Dynamo leaves the scan HOP and hits a data-dependent scalar.
+    # fullgraph: a graph break would split one measurement across two compiles, and
+    # control_flow's scan HOP fails on a data-dependent scalar without it.
     compiled = torch.compile(built.fn, fullgraph=True)
     started = time.perf_counter()
     try:
         compiled(*built.args)
     except RuntimeError as exc:
-        # Frontend-only mode compiles and then refuses to launch; that is the point
-        # being reached, not a failure. Anything else is real.
+        # Frontend-only mode compiles and then refuses to launch, which is success.
         if not config.frontend_only or "TORCH_SPYRE_FRONTEND_ONLY" not in str(exc):
             raise
     wall_ms = (time.perf_counter() - started) * 1000
 
-    # Recorded after the compile, so they describe it. compile_wall_ms is deliberately
-    # redundant with the recorder's own total: when the two disagree, the recorder is
-    # missing a region, and that is worth knowing from the record itself.
+    # compile_wall_ms always exceeds the recorder's total, and is not a check on it:
+    # the spyre_compile region wraps only the compile_fx call, so Dynamo tracing and
+    # the first device touch's lazy init both sit outside it. What it bounds is how
+    # much of the call the recorder does not see.
+    #
+    # compiled=True is the driver's own verdict, recorded last. The recorder stamps an
+    # error on any region an exception passed through even when a caller swallows it,
+    # so a reader cannot tell a failed compile from a successful one with a swallowed
+    # provenance error -- this can.
     timing_recorder.set_run_meta(
         compile_wall_ms=wall_ms,
         peak_rss_kb=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
         kernels_skipped=len(
             timing_recorder.RECORDER.run_meta.get("backend_skipped_kernels", []) or []
         ),
+        compiled=True,
     )
     return 0
 
 
 def _config_snapshot(config: Any) -> dict[str, Any]:
-    """Resolved Spyre config, so a record says what planning produced it.
+    """The whole resolved Spyre config; a curated list of names would go stale.
 
-    Taken whole rather than from a list of names: a curated list goes stale silently,
-    and a record that names the wrong configuration is worse than one that names too
-    much. ``dir()`` does not work here -- install_config_module hides the entries behind
-    a wrapper, and iterating attributes returns nothing.
+    ``dir()`` finds nothing here: install_config_module hides the entries.
     """
-    for api in ("get_config_copy", "shallow_copy_dict", "to_dict"):
-        getter = getattr(config, api, None)
-        if callable(getter):
-            return dict(getter())
-    return {}
+    return dict(config.get_config_copy())
 
 
 # ---------------------------------------------------------------------------
@@ -214,11 +207,39 @@ def _child_env(
         env["TORCH_SPYRE_FRONTEND_ONLY"] = "1"
     else:
         env.pop("TORCH_SPYRE_FRONTEND_ONLY", None)
-    # The arm goes last so a point can deliberately override anything above it, and its
-    # label travels separately so the child can record which arm produced the record.
+    # Last, so an arm can override anything above it.
     env.update(point.env)
-    env[ARM_ENV_VAR] = point.arm
     return env
+
+
+def _run_child(
+    argv: list[str], env: dict[str, str], timeout_s: int
+) -> subprocess.CompletedProcess:
+    """Run one sample, killing its whole process group if it outlives the timeout.
+
+    ``subprocess.run``'s own timeout kills the direct child only. With the backend on,
+    the child has spawned a compiler of its own, and that grandchild keeps running --
+    into the next sample, competing for the device it is about to be measured on. A new
+    session makes the child a process-group leader so the group can be signalled.
+    """
+    with subprocess.Popen(
+        argv,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    ) as proc:
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            proc.communicate()
+            raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
 def run_point(
@@ -250,23 +271,23 @@ def run_point(
             workload,
             "--sample-index",
             str(sample),
+            "--arm",
+            point.arm,
         ]
         for key, value in params.items():
             argv += ["--param", f"{key}={value}"]
 
         started = time.perf_counter()
+        failed = ""
         try:
-            proc = subprocess.run(
+            proc = _run_child(
                 argv,
-                env=_child_env(target, record_name, cache_dir, frontend_only, point),
-                capture_output=True,
-                text=True,
-                timeout=timeout_s,
-                check=False,
+                _child_env(target, record_name, cache_dir, frontend_only, point),
+                timeout_s,
             )
             elapsed = time.perf_counter() - started
             if proc.returncode != 0:
-                failures.append(f"{label}: exit {proc.returncode}")
+                failed = f"{label}: exit {proc.returncode}"
                 tail = (proc.stderr or "").strip().splitlines()[-5:]
                 print(f"  {label}: FAILED after {elapsed:.1f}s", file=sys.stderr)
                 for line in tail:
@@ -274,10 +295,22 @@ def run_point(
             else:
                 print(f"  {label}: {elapsed:.1f}s")
         except subprocess.TimeoutExpired:
-            failures.append(f"{label}: timed out after {timeout_s}s")
+            failed = f"{label}: timed out after {timeout_s}s"
             print(f"  {label}: TIMED OUT after {timeout_s}s", file=sys.stderr)
         finally:
             shutil.rmtree(cache_dir, ignore_errors=True)
+
+        if failed:
+            failures.append(failed)
+            # A point whose warmup failed has nothing to measure, and its samples will
+            # fail the same way. At the default timeout, not stopping costs four hours
+            # per hanging point.
+            if is_warmup:
+                print(
+                    f"  {name}: skipping {samples} sample(s), warmup failed",
+                    file=sys.stderr,
+                )
+                return failures
 
     return failures
 
@@ -285,8 +318,7 @@ def run_point(
 def load_plan(path: str, tier: str | None = None) -> list[Point]:
     """Load a plan, keeping the points that belong to ``tier``.
 
-    A bare list is still accepted, and a point with no ``tiers`` runs in every tier, so
-    a plan written before tiers existed behaves exactly as it did.
+    A point with no ``tiers`` runs in every tier, and a bare list is still a plan.
     """
     with open(path) as handle:
         plan = json.load(handle)
@@ -305,7 +337,6 @@ def load_plan(path: str, tier: str | None = None) -> list[Point]:
                 workload=entry["workload"],
                 params={k: v for k, v in entry.items() if k not in RESERVED_PLAN_KEYS},
                 env=env,
-                tiers=tiers,
             )
         )
     return points
@@ -344,42 +375,61 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--timeout", type=int, default=3600, help="per-sample timeout in seconds"
     )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="add to a records directory that already holds records",
+    )
     parser.add_argument("--_sample", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--sample-index", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--arm", default="", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
-    # The worker re-enters this file as a script, so the repository root has to be
-    # importable for `from tools.frontend_timing import workloads` to resolve.
-    repo_root = os.path.dirname(os.path.dirname(_HERE))
-    if repo_root not in sys.path:
-        sys.path.insert(0, repo_root)
+    # The worker imports `workloads` as a plain module beside this file.
+    if _HERE not in sys.path:
+        sys.path.insert(0, _HERE)
 
     if args._sample:
         if not args.workload:
             raise SystemExit("--_sample requires --workload")
-        return run_sample(args.workload, parse_params(args.param), args.sample_index)
+        return run_sample(
+            args.workload, parse_params(args.param), args.sample_index, args.arm
+        )
 
     if bool(args.plan) == bool(args.workload):
         raise SystemExit("pass exactly one of --plan or --workload")
 
-    cli_env = {k: str(v) for k, v in parse_params(args.env).items()}
+    # Environment values stay strings: int() would turn SENCORES=0007 into 7 and
+    # 1_000 into 1000, so an arm would not be the arm that was asked for.
+    cli_env = parse_env(args.env)
     if args.plan:
         points = load_plan(args.plan, args.tier)
         if cli_env:
             raise SystemExit("--env applies to a single point; a plan carries its own")
-    else:
-        points = [
-            Point(
-                workload=args.workload,
-                params=parse_params(args.param),
-                env=cli_env,
+        if args.param:
+            # Previously ignored in silence, so a mistyped single-point invocation
+            # ran the whole plan instead.
+            raise SystemExit(
+                "--param applies to a single point; a plan carries its own"
             )
-        ]
+    else:
+        points = [Point(args.workload, parse_params(args.param), cli_env)]
     if not points:
         raise SystemExit(f"no plan points declare tier {args.tier!r}")
 
     out_dir = resolve_out_dir(args.out)
     os.makedirs(out_dir, exist_ok=True)
+    existing = existing_records(out_dir)
+    if existing and not args.append:
+        # The recorder puts the pid in each filename, so nothing is ever replaced: a
+        # second sweep into the same directory leaves both builds' samples side by
+        # side and the summarizer averages them into one point. Loud here beats wrong
+        # at the end -- and the default directory persists between runs.
+        raise SystemExit(
+            f"{out_dir} already holds {len(existing)} record(s); records are never "
+            "replaced, so a second sweep here would be summarized together with the "
+            "first. Use a fresh --out, or --append if mixing builds is deliberate."
+        )
 
     print(f"records -> {out_dir}")
     tier_note = f", tier {args.tier}" if args.tier else ""
