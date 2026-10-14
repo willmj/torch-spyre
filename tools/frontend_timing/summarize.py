@@ -386,15 +386,42 @@ def summarize(records: list[Record]) -> list[PointSummary]:
 #: build's. Disagreement here is that situation, reported rather than averaged.
 _IDENTITY_KEYS = ("git_sha", "torch_version", "torch_spyre_version")
 
+#: Config entries that are per-record by construction and so can never agree
+#: across a sweep. ``timing_out`` is each sample's own destination file and the
+#: driver gives every sample its own, so comparing it verbatim makes the conflict
+#: check fire on every multi-sample sweep -- which is every real one. The config
+#: declares its own ``_cache_config_ignore_prefix`` for the same reason, so that
+#: is honoured here rather than duplicated.
+_CONFIG_IGNORED = ("timing_out",)
+
+
+def comparable_config(meta: dict[str, Any]) -> Any:
+    """``spyre_config`` with the per-record entries dropped."""
+    config = meta.get("spyre_config")
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except ValueError:
+            return config
+    if not isinstance(config, dict):
+        return config
+    ignored = set(_CONFIG_IGNORED)
+    ignored.update(config.get("_cache_config_ignore_prefix") or ())
+    return {k: v for k, v in config.items() if k not in ignored}
+
 
 def identity_conflicts(records: list[Record]) -> list[str]:
     """Keys on which these records disagree, with the values they disagree on."""
     conflicts = []
-    for key in _IDENTITY_KEYS + ("spyre_config",):
+    for key in _IDENTITY_KEYS:
         seen = {json.dumps(r.meta.get(key), sort_keys=True) for r in records}
         if len(seen) > 1:
             shown = ", ".join(sorted(s[:60] for s in seen)[:3])
             conflicts.append(f"{key} differs across records: {shown}")
+    seen = {json.dumps(comparable_config(r.meta), sort_keys=True) for r in records}
+    if len(seen) > 1:
+        shown = ", ".join(sorted(s[:60] for s in seen)[:3])
+        conflicts.append(f"spyre_config differs across records: {shown}")
     return conflicts
 
 
