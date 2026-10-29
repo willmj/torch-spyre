@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 import logging
 import math
 import time
@@ -135,7 +136,7 @@ from torch_spyre._inductor.constants import (
     POOL_OPS,
 )
 
-from torch_spyre._inductor import config
+from torch_spyre._inductor import config, timing_recorder
 from torch_spyre._inductor.logging_utils import get_inductor_logger, warn_once
 from torch_spyre._inductor.loop_info import (
     CoarseTileInfo,
@@ -935,6 +936,67 @@ class _BufferResidencyChecks:
         return None
 
 
+#: ``plan_allocation``'s template hooks, timed as one region each. The per-pass
+#: timer sees the whole pass as a single region, and across a 26-point sweep that
+#: region is 91% of frontend compile -- with nothing to say which part. These are
+#: the finest attribution available without guessing at internals.
+#:
+#: Named rather than wrapped at the call sites: the skeleton's shape is not ours
+#: to own, and main changes it. ``_materialize_selection`` came with coarse
+#: tiling and went again in #5246, and ``_get_spill_reasons`` has changed arity
+#: twice -- each of which conflicted against a block of ``with`` statements while
+#: leaving this list to merge cleanly. A hook that is renamed or removed simply
+#: stops being timed, and one that is added is timed by adding its name here.
+#: Hook name -> region suffix. The suffix is given rather than derived so the
+#: long ones read as regions rather than as method names, and so a hook can be
+#: renamed upstream without renaming a metric that twelve nightly sweeps have
+#: already recorded under the old name.
+_TIMED_HOOKS = {
+    "_run_passes": "run_passes",
+    "_prepare_buffers": "prepare_buffers",
+    "_build_solver": "build_solver",
+    "_solve": "solve",
+    "_materialize_selection": "materialize_selection",
+    "_finalize_lx_relayout_allocation": "finalize_relayout",
+    "_post_solve": "post_solve",
+    "_get_spill_reasons": "spill_reasons",
+    "_push_allocation": "push_allocation",
+    "_log_lx_pinning": "log_pinning",
+}
+
+
+def _time_hooks(cls: type) -> type:
+    """Wrap each of ``_TIMED_HOOKS`` the class defines in a timing region.
+
+    Applied to the subclass as well as the base: an override is a different
+    function object, and timing the base's method would miss it entirely.
+    ``timing_recorder.stage`` is inert unless ``TORCH_SPYRE_TIMING=1``, so this
+    costs one Python frame per hook on a production compile.
+    """
+    for name, suffix in _TIMED_HOOKS.items():
+        attr = cls.__dict__.get(name)
+        if attr is None:
+            continue
+        # A hook may be a staticmethod -- _run_passes is -- and wrapping the
+        # function it holds without putting it back in the same descriptor adds
+        # a self argument the original does not take.
+        kind = type(attr) if isinstance(attr, (staticmethod, classmethod)) else None
+        function = attr.__func__ if kind else attr
+        if getattr(function, "_ts_timed", False):
+            continue
+        region = f"stage:Scratchpad:{suffix}"
+
+        @functools.wraps(function)
+        def timed(*args, _f=function, _r=region, **kwargs):
+            with timing_recorder.stage(_r):
+                return _f(*args, **kwargs)
+
+        timed._ts_timed = True  # type: ignore[attr-defined]
+        setattr(cls, name, kind(timed) if kind else timed)
+    return cls
+
+
+@_time_hooks
 class ScratchpadAllocator:
     """
     Class for allocating on scratchpad
@@ -3028,6 +3090,7 @@ class _DivisionMap(NamedTuple):
     enumerated: set[str]
 
 
+@_time_hooks
 class CoOptimizingAllocator(ScratchpadAllocator):
     def __init__(
         self,
