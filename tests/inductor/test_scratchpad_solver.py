@@ -2943,6 +2943,96 @@ class UniquenessCheckTest(TestCase):
         self.assertTrue(all(b.address is None for b in plan))
 
 
+@unittest.skipUnless(_HAS_ORTOOLS, "cpsat placement unit tests need ortools")
+class TieBreakTest(TestCase):
+    """``config.cp_sat_tiebreak``: whichever optimum the search reaches, the
+    plan is the same, and it is still an optimum.
+
+    Two buffers live together, so resident they stack in either order. The
+    decision weights alone would spill both (``in_buffer = 0`` weighs least),
+    so a tiebreak that does not hold the objective fails the residency checks.
+    """
+
+    def setUp(self):
+        self.enterContext(config.patch({"cp_sat_tiebreak": True}))
+
+    @staticmethod
+    def _bufs():
+        return [
+            CoreDivisionBuffer("b0", 128, [0, 2], core_divisions=[CoreDivision()]),
+            CoreDivisionBuffer("b1", 128, [1, 3], core_divisions=[CoreDivision()]),
+        ]
+
+    @staticmethod
+    def _spill_cost(buffers):
+        # Not a whole number, so the cost path minimizes a floating-point objective.
+        return sum(1234.5 * (1 - b.sym_is_lx) for b in buffers)
+
+    @staticmethod
+    def _main_solve_at(offsets):
+        """Fix the first solve's offsets, in alignment units, to one optimum."""
+        solve = CpSatLayoutSolver._solve_and_record
+
+        def solve_at(self, solver, model, *, objective=False):
+            names = [v.name for v in model.proto.variables]
+            for name, offset in offsets.items():
+                var = model.get_int_var_from_proto_index(names.index(f"off_{name}"))
+                model.add_hint(var, offset)
+            solver.parameters.fix_variables_to_their_hinted_value = True
+            try:
+                return solve(self, solver, model, objective=objective)
+            finally:
+                solver.parameters.fix_variables_to_their_hinted_value = False
+                model.clear_hints()
+
+        return mock.patch.object(CpSatLayoutSolver, "_solve_and_record", solve_at)
+
+    def _addresses(self, offsets, tiebreak=True):
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        cost = self._spill_cost(solver.buffers)
+        with config.patch({"cp_sat_tiebreak": tiebreak}), self._main_solve_at(offsets):
+            plan = solver.plan_layout_and_core_divisions(cost)
+        return {b.name: b.address for b in plan}
+
+    def test_either_optimum_gives_the_same_plan(self):
+        below, above = {"b0": 0, "b1": 1}, {"b0": 1, "b1": 0}
+        self.assertNotEqual(
+            self._addresses(below, tiebreak=False),
+            self._addresses(above, tiebreak=False),
+            "without the tiebreak the plan is whichever optimum the search reached",
+        )
+        self.assertEqual(self._addresses(below), self._addresses(above))
+
+    def test_a_floating_point_cost_is_held(self):
+        solver = CpSatLayoutSolver(self._bufs(), 1 << 20)
+        plan = solver.plan_layout_and_core_divisions(self._spill_cost(solver.buffers))
+        self.assertTrue(all(b.address is not None for b in plan))
+        stats = solver.last_solve_stats["tiebreak"]
+        self.assertEqual(stats["decisions"]["status"], "OPTIMAL")
+        self.assertEqual(stats["placement"]["status"], "OPTIMAL")
+
+    def test_tied_divisions_go_to_the_most_cores(self):
+        """Division 0 is the unsplit one, which the decision weights alone
+        would take."""
+        divisions = [CoreDivision(), CoreDivision(splits={256: 4})]
+        buffer = CoreDivisionBuffer("b", 128, [0, 1], core_divisions=divisions)
+        solver = CpSatLayoutSolver([buffer], 1 << 20)
+        (plan,) = solver.plan_layout_and_core_divisions(
+            self._spill_cost(solver.buffers)
+        )
+        self.assertEqual(plan.core_divisions[plan.chosen_division].cores_used, 4)
+
+    def test_the_last_ladder_stage_is_held(self):
+        """Placement-only buffers run only the residency stage, which the
+        ladder pins only when a later stage follows it."""
+        bufs = [
+            LifetimeBoundBuffer("b0", 128, [0, 2]),
+            LifetimeBoundBuffer("b1", 128, [1, 3]),
+        ]
+        plan = CpSatLayoutSolver(bufs, 1 << 20).plan_layout()
+        self.assertTrue(all(b.address is not None for b in plan))
+
+
 class TestCpSatUnallocatedReads(TestCase):
     """Device-free coverage of the CP-SAT objective/residency gate for the
     placement-only path.

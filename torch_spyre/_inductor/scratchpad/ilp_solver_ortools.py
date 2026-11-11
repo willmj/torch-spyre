@@ -100,7 +100,9 @@ below are written once against whichever wrapper ``_wrap`` chose.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from functools import cache
@@ -162,6 +164,14 @@ _CRASHING_SUBSOLVERS = (
     "variables_shaving_no_lp",
     "variables_shaving_max_lp",
 )
+
+
+def _tiebreak_weight(name: str) -> int:
+    """A weight in [1, 2**20] that depends only on a variable's name, so a model
+    weighs its plans the same way on every run and every machine."""
+    digest = hashlib.blake2b(name.encode(), digest_size=4).digest()
+    return 1 + int.from_bytes(digest, "big") % (1 << 20)
+
 
 # Buffer type the wrapper carries: the base placement wrapper holds any
 # LifetimeBoundBuffer; the joint subclass binds this to CoreDivisionBuffer.
@@ -866,6 +876,9 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
             if not isinstance(cp_cost, (int, float)):
                 # if the cost is non-constant, we minimize it
                 # if the cost is constant, we use any solution
+                if config.cp_sat_tiebreak:
+                    # An integer objective, so _break_ties can hold it exactly.
+                    cp_cost = self._integer_cost(model, cp_cost)
                 model.minimize(cp_cost)
             status = self._solve_and_record(solver, model, objective=True)
             if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -1522,7 +1535,16 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                     model.minimize(sum(tile_terms))
                     status = _solve_stage("tile count")
 
-        final_tensors = self._extract(solver, tensors)
+        plan = solver
+        if config.cp_sat_tiebreak and status == cp_model.OPTIMAL:
+            plan = self._break_ties(model, solver, tensors)
+        elif config.cp_sat_tiebreak and status == cp_model.FEASIBLE:
+            logger.warning(
+                "[CP-SAT layout solver] the solve stopped at its time limit "
+                "before proving an optimum, so CP_SAT_TIEBREAK cannot make "
+                "this plan reproducible"
+            )
+        final_tensors = self._extract(plan, tensors)
 
         if logger.isEnabledFor(logging.DEBUG):
             if status is None:
@@ -1560,6 +1582,135 @@ class CpSatLayoutSolver(CoreDivisionLayoutSolver):
                 )
 
         return final_tensors
+
+    def _break_ties(
+        self,
+        model: "cp_model.CpModel",
+        solver: "cp_model.CpSolver",
+        tensors: dict[str, _LifetimeBufferWithCpVars],
+    ) -> "cp_model.CpSolver":
+        """Pick one of the optima ``solver`` holds, the same one on every run.
+
+        The parallel search returns whichever optimum a worker reaches first.
+        With the objective held exactly at the value reached (an integer
+        objective, see ``_integer_cost``), a second solve takes the optimum
+        using the most cores, as the ladder's parallelism stage does, and among
+        those minimizes a weighted sum of the plan's decisions; distinct
+        weights make two plans almost never weigh the same, as a plain sum does
+        whenever two buffers trade values. Addresses are left out of that sum:
+        no objective prices one, so every legal shift ties, and an offset
+        optimum is costly to prove. A third solve fixes the decisions and
+        places the buffers with one search worker, whose search does not
+        depend on timing. Returns the last of these solvers that found a plan.
+        """
+        self._pin_objective(model, solver)
+        stats: dict = {}
+        self.last_solve_stats["tiebreak"] = stats
+        decisions = [v for sb in tensors.values() for v in sb.decision_variables()]
+        model.clear_hints()
+        for index in range(len(model.proto.variables)):
+            var = model.get_int_var_from_proto_index(index)
+            model.add_hint(var, solver.Value(var))
+        weights = [_tiebreak_weight(var.name) for var in decisions]
+        ranked = cp_model.LinearExpr.weighted_sum(decisions, weights)
+        # The weights alone favour each variable's smallest value, and division
+        # 0 is the unsplit one; scaled past the weighted sum's whole range, the
+        # core count decides first.
+        reach = 0
+        for var, weight in zip(decisions, weights):
+            low, *_, high = model.proto.variables[var.index].domain
+            reach += weight * (high - low)
+        cores = [sb.cores for sb in tensors.values() if sb.cores is not None]
+        model.minimize(ranked - (reach + 1) * sum(cores))
+        chosen = self._solve_tiebreak_stage(
+            model, solver.parameters, stats, "decisions"
+        )
+        if chosen is None:
+            return solver
+        placement = model.clone()
+        placement.clear_objective()
+        placement.clear_hints()
+        for var in decisions:
+            placement.add(var == chosen.Value(var))
+        placed = self._solve_tiebreak_stage(
+            placement, solver.parameters, stats, "placement", workers=1
+        )
+        return chosen if placed is None else placed
+
+    @staticmethod
+    def _integer_cost(model: "cp_model.CpModel", cost: Any) -> Any:
+        """``cost`` with its coefficients scaled to integers, as CP-SAT scales a
+        floating-point objective before solving it: by the largest power of two
+        that keeps the cost's range within 2**53.
+
+        CP-SAT constraints take only integer coefficients, so this is the form
+        of the cost that can be held at its optimum exactly. A floating-point
+        pin would have to allow for the rounding of every term over its
+        variable's whole domain, which on a large model admits dearer plans.
+        """
+        flat = cp_model.FlatFloatExpr(cost)
+        reach = [
+            max(abs(d) for d in model.proto.variables[var.index].domain)
+            for var in flat.vars
+        ]
+        activity = sum(abs(c) * r for c, r in zip(flat.coeffs, reach))
+        scale = 2.0 ** math.floor(math.log2(2**53 / max(activity, 1.0)))
+        return cp_model.LinearExpr.weighted_sum(
+            flat.vars, [round(c * scale) for c in flat.coeffs]
+        )
+
+    @staticmethod
+    def _pin_objective(model: "cp_model.CpModel", solver: "cp_model.CpSolver") -> None:
+        """Hold the objective the last solve minimized at the value it reached."""
+        proto = model.proto
+        assert not proto.has_floating_point_objective(), "see _integer_cost"
+        if not proto.has_objective():
+            return  # a constant cost: every feasible plan is optimal
+        objective = proto.objective
+        terms = cp_model.LinearExpr.weighted_sum(
+            [model.get_int_var_from_proto_index(v) for v in objective.vars],
+            list(objective.coeffs),
+        )
+        # The value is scaling_factor * (terms + offset); maximizing negates
+        # the coefficients and sets scaling_factor to -1.
+        scaling = objective.scaling_factor or 1.0
+        model.add(terms <= round(solver.ObjectiveValue() / scaling - objective.offset))
+
+    @staticmethod
+    def _solve_tiebreak_stage(
+        model: "cp_model.CpModel",
+        parameters: Any,
+        stats: dict,
+        stage: str,
+        workers: Optional[int] = None,
+    ) -> Optional["cp_model.CpSolver"]:
+        """One ``_break_ties`` solve, on its own solver so a failure leaves the
+        previous plan readable. None when it finds no plan."""
+        solver = cp_model.CpSolver()
+        solver.parameters.copy_from(parameters)
+        if workers is not None:
+            solver.parameters.num_search_workers = workers
+        status = solver.Solve(model)
+        stats[stage] = {
+            "status": solver.StatusName(status),
+            "solve_s": round(solver.WallTime(), 3),
+        }
+        if status == cp_model.OPTIMAL:
+            return solver
+        if status == cp_model.FEASIBLE:
+            logger.warning(
+                "[CP-SAT layout solver] the tiebreak's %s solve stopped at its "
+                "time limit; its plan can still vary between runs",
+                stage,
+            )
+            return solver
+        logger.warning(
+            "[CP-SAT layout solver] the tiebreak's %s solve found no plan (%s); "
+            "keeping the one before it",
+            stage,
+            solver.StatusName(status),
+        )
+        return None
 
     @staticmethod
     def _relayout_copies(

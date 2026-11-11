@@ -500,6 +500,17 @@ enable_uniqueness_check: bool = (
     os.environ.get("SPYRE_ENABLE_UNIQUENESS_CHECK", "0") == "1"
 )
 
+# Make equally good CP-SAT layouts resolve the same way on every compile. The
+# parallel search returns whichever optimum a worker reaches first, so LX
+# offsets, core splits and relayout copies can differ between two compiles of
+# one graph. With this on, the cost objective is solved in integer form and each
+# layout solve is followed by two more: one holds the objective exactly at the
+# value just reached and takes the optimal plan using the most cores, then a
+# fixed order over its decisions (residency, merges, relayout reads, core
+# divisions), and one fixes those and places the buffers with a single search
+# worker. Each gets the full ``cpsat_time_limit_seconds``.
+cp_sat_tiebreak: bool = os.environ.get("CP_SAT_TIEBREAK", "0") == "1"
+
 # solver_relayout_edge_context's same-tile-group exception (#5057): without it,
 # a coarse-tiled producer or consumer can never host a relayout candidate at
 # all, even when the pair shares one loop_group_id (same iteration, same tile,

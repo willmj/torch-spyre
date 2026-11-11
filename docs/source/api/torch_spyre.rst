@@ -730,6 +730,13 @@ Environment Variables
      - Wall-clock budget for one CP-SAT solve (default ``60``; ``0``
        disables the limit). Applies separately to each optimization phase.
        A timeout may return a feasible plan without proving optimality.
+   * - ``CP_SAT_TIEBREAK``
+     - Make CP-SAT layout plans reproducible (default ``0``). When several
+       plans are equally good, every compile picks the same one, the one
+       using the most cores first, so LX offsets and core splits match from
+       run to run. Each solve is followed
+       by two more, each with the full ``CPSAT_TIME_LIMIT_SECONDS``. A solve
+       that stops at its time limit is not made reproducible.
    * - ``HBM_POOL_PLANNING``
      - Enable HBM-pool planning for intermediates not in LX
        (default ``1``)
